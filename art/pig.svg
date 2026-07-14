@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="130" height="260" viewBox="0 0 130 260">
+  <!-- 俯视小猪,占两格的长条身形,头朝上(原创卡通风格) -->
+  <path d="M65 236 q13 12 4 20 q-10 6 -9 -5" fill="none" stroke="#d97ba0" stroke-width="6" stroke-linecap="round"/>
+  <ellipse cx="65" cy="140" rx="48" ry="94" fill="#f6a8c0" stroke="#c2688e" stroke-width="4"/>
+  <path d="M30 54 L18 26 L50 40 Z" fill="#ee8fb0" stroke="#c2688e" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M100 54 L112 26 L80 40 Z" fill="#ee8fb0" stroke="#c2688e" stroke-width="3" stroke-linejoin="round"/>
+  <ellipse cx="65" cy="36" rx="22" ry="15" fill="#f9bed2" stroke="#c2688e" stroke-width="3"/>
+  <circle cx="57" cy="36" r="3.5" fill="#a15074"/>
+  <circle cx="73" cy="36" r="3.5" fill="#a15074"/>
+  <circle cx="46" cy="64" r="4.5" fill="#5b2c42"/>
+  <circle cx="84" cy="64" r="4.5" fill="#5b2c42"/>
+  <ellipse cx="65" cy="150" rx="28" ry="56" fill="#f9bed2" opacity="0.55"/>
+</svg>

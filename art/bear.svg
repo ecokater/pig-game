@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="130" height="170" viewBox="0 0 130 170">
+  <!-- 俯视棕熊,头朝上(原创卡通风格) -->
+  <ellipse cx="65" cy="98" rx="50" ry="64" fill="#8a5a2b" stroke="#5e3a17" stroke-width="4"/>
+  <circle cx="33" cy="28" r="14" fill="#7a4d22" stroke="#5e3a17" stroke-width="3"/>
+  <circle cx="97" cy="28" r="14" fill="#7a4d22" stroke="#5e3a17" stroke-width="3"/>
+  <ellipse cx="65" cy="36" rx="27" ry="21" fill="#8a5a2b" stroke="#5e3a17" stroke-width="3"/>
+  <ellipse cx="65" cy="29" rx="13" ry="9" fill="#c99a63"/>
+  <circle cx="65" cy="27" r="4.5" fill="#3a2410"/>
+  <circle cx="49" cy="42" r="4.5" fill="#2e1c0c"/>
+  <circle cx="81" cy="42" r="4.5" fill="#2e1c0c"/>
+  <ellipse cx="65" cy="105" rx="26" ry="34" fill="#a5793f" opacity="0.5"/>
+</svg>
