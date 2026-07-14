@@ -1,5 +1,5 @@
 extends Node2D
-## 主场景:反向 Arrow Puzzle,共 10 关。
+## 主场景:反向 Arrow Puzzle,共 100 关。
 ## 小猪占两格、在开口外等待,点击后沿固定方向滑入猪圈,
 ## 撞到栅栏或其他小猪即停下;开口只进不出。
 ## 在限定步数内全部进圈则过关。
@@ -7,6 +7,7 @@ extends Node2D
 const VIEW := Vector2(1024.0, 1280.0)
 const PLAY_AREA := Rect2(16.0, 170.0, 992.0, 1050.0)
 const BASE_CELL := 150.0
+const PROGRESS_CFG := "user://progress.cfg"
 
 const PigScript := preload("res://scripts/pig.gd")
 const BearScript := preload("res://scripts/bear.gd")
@@ -18,6 +19,7 @@ const CLOUD_TEX := preload("res://art/cloud.svg")
 const CROSS_TEX := preload("res://art/cross.svg")
 
 static var level_index := 0
+static var progress_applied := false  # 存档只在本次运行首次进场时应用
 
 var levels: Array = []
 var cell_size := BASE_CELL
@@ -48,131 +50,93 @@ var _grass: PackedVector2Array = PackedVector2Array()
 var _ui_font: SystemFont
 
 
-# ---------- 关卡数据(已用求解器逐关验证可解,难度递增) ----------
+# ---------- 进度持久化 ----------
 
-static func _rect(w: int, h: int, y0: int = 0) -> Array:
-	var cells: Array = []
-	for x in w:
-		for y in h:
-			cells.append(Vector2i(x, y + y0))
-	return cells
+static func _load_progress() -> int:
+	var cfg := ConfigFile.new()
+	if cfg.load(PROGRESS_CFG) == OK:
+		return int(cfg.get_value("progress", "max_unlocked", 0))
+	return 0
 
 
-static func _levels() -> Array:
-	var R := Vector2i(1, 0)
-	var L := Vector2i(-1, 0)
-	var D := Vector2i(0, 1)
-	var U := Vector2i(0, -1)
+static func _save_progress(max_unlocked: int) -> void:
+	var cfg := ConfigFile.new()
+	cfg.set_value("progress", "max_unlocked", max_unlocked)
+	cfg.save(PROGRESS_CFG)
+
+
+# ---------- 关卡读取 ----------
+
+static func _parse_v2i_array(arr: Array) -> Array:
+	## 把 JSON 解析出的 [[x,y], ...] 转换成 Array[Vector2i]
+	var result: Array = []
+	for item in arr:
+		result.append(Vector2i(int(item[0]), int(item[1])))
+	return result
+
+
+static func _parse_pig(raw: Array) -> Array:
+	## raw = [[tx,ty],[hx,hy],[dx,dy]]  → [Vector2i, Vector2i, Vector2i]
 	return [
-		# 第 1 关:2×2,两只猪各占一列,熟悉操作。最优 2 步。
-		{"steps": 4, "pen": _rect(2, 2),
-		 "openings": [[Vector2i(0, 0), U], [Vector2i(1, 0), U]],
-		 "pigs": [
-			[Vector2i(0, -2), Vector2i(0, -1), D],
-			[Vector2i(1, -2), Vector2i(1, -1), D]]},
-		# 第 2 关:3×2,先送下排,再上排。最优 3 步。
-		{"steps": 5, "pen": _rect(3, 2),
-		 "openings": [[Vector2i(0, 1), L], [Vector2i(0, 0), U], [Vector2i(2, 0), R]],
-		 "pigs": [
-			[Vector2i(-2, 1), Vector2i(-1, 1), R],
-			[Vector2i(0, -2), Vector2i(0, -1), D],
-			[Vector2i(4, 0), Vector2i(3, 0), L]]},
-		# 第 3 关:4×2,竖猪先立右墙,横猪靠上去。最优 4 步。
-		{"steps": 6, "pen": _rect(4, 2),
-		 "openings": [[Vector2i(3, 1), D], [Vector2i(0, 0), L], [Vector2i(0, 1), L], [Vector2i(0, 0), U]],
-		 "pigs": [
-			[Vector2i(3, 3), Vector2i(3, 2), U],
-			[Vector2i(-2, 0), Vector2i(-1, 0), R],
-			[Vector2i(-2, 1), Vector2i(-1, 1), R],
-			[Vector2i(0, -2), Vector2i(0, -1), D]]},
-		# 第 4 关:3×3 留一个空格,注意别把入口堵死。最优 4 步。
-		{"steps": 6, "pen": _rect(3, 3),
-		 "openings": [[Vector2i(0, 0), U], [Vector2i(2, 0), R], [Vector2i(1, 2), D], [Vector2i(2, 2), D]],
-		 "pigs": [
-			[Vector2i(0, -2), Vector2i(0, -1), D],
-			[Vector2i(4, 0), Vector2i(3, 0), L],
-			[Vector2i(1, 4), Vector2i(1, 3), U],
-			[Vector2i(2, 4), Vector2i(2, 3), U]]},
-		# 第 5 关:L 形猪圈,10 格 5 猪。最优 5 步。
-		{"steps": 7,
-		 "pen": _rect(3, 2) + [Vector2i(0, 2), Vector2i(1, 2), Vector2i(0, 3), Vector2i(1, 3)],
-		 "openings": [[Vector2i(2, 0), U], [Vector2i(0, 0), L], [Vector2i(0, 1), L],
-			[Vector2i(0, 3), D], [Vector2i(1, 3), D]],
-		 "pigs": [
-			[Vector2i(2, -2), Vector2i(2, -1), D],
-			[Vector2i(-2, 0), Vector2i(-1, 0), R],
-			[Vector2i(-2, 1), Vector2i(-1, 1), R],
-			[Vector2i(0, 5), Vector2i(0, 4), U],
-			[Vector2i(1, 5), Vector2i(1, 4), U]]},
-		# 第 6 关:4×3 满填 6 猪,四面开口。最优 6 步。
-		{"steps": 8, "pen": _rect(4, 3),
-		 "openings": [[Vector2i(0, 0), L], [Vector2i(0, 2), L], [Vector2i(1, 0), U],
-			[Vector2i(3, 0), U], [Vector2i(0, 2), D], [Vector2i(2, 2), D]],
-		 "pigs": [
-			[Vector2i(-2, 0), Vector2i(-1, 0), R],
-			[Vector2i(-2, 2), Vector2i(-1, 2), R],
-			[Vector2i(1, -2), Vector2i(1, -1), D],
-			[Vector2i(3, -2), Vector2i(3, -1), D],
-			[Vector2i(0, 4), Vector2i(0, 3), U],
-			[Vector2i(2, 4), Vector2i(2, 3), U]]},
-		# 第 7 关:4×3,一条长依赖链,只有一族正确顺序。最优 6 步。
-		{"steps": 7, "pen": _rect(4, 3),
-		 "openings": [[Vector2i(0, 0), L], [Vector2i(0, 0), U], [Vector2i(1, 0), U],
-			[Vector2i(0, 2), L], [Vector2i(2, 2), D], [Vector2i(3, 2), D]],
-		 "pigs": [
-			[Vector2i(-2, 0), Vector2i(-1, 0), R],
-			[Vector2i(0, -2), Vector2i(0, -1), D],
-			[Vector2i(1, -2), Vector2i(1, -1), D],
-			[Vector2i(-2, 2), Vector2i(-1, 2), R],
-			[Vector2i(2, 4), Vector2i(2, 3), U],
-			[Vector2i(3, 4), Vector2i(3, 3), U]]},
-		# 第 8 关:带顶臂的 14 格圈,7 只猪。最优 7 步。
-		{"steps": 8,
-		 "pen": [Vector2i(0, 0), Vector2i(1, 0)] + _rect(4, 3, 1),
-		 "openings": [[Vector2i(0, 0), L], [Vector2i(0, 3), D], [Vector2i(0, 3), L],
-			[Vector2i(1, 3), D], [Vector2i(3, 1), R], [Vector2i(2, 3), D], [Vector2i(3, 3), D]],
-		 "pigs": [
-			[Vector2i(-2, 0), Vector2i(-1, 0), R],
-			[Vector2i(0, 5), Vector2i(0, 4), U],
-			[Vector2i(-2, 3), Vector2i(-1, 3), R],
-			[Vector2i(1, 5), Vector2i(1, 4), U],
-			[Vector2i(5, 1), Vector2i(4, 1), L],
-			[Vector2i(2, 5), Vector2i(2, 4), U],
-			[Vector2i(3, 5), Vector2i(3, 4), U]]},
-		# 第 9 关:十字形猪圈,有的猪要借道别人的等候位。最优 6 步。
-		{"steps": 7,
-		 "pen": [Vector2i(1, 0), Vector2i(2, 0),
-			Vector2i(0, 1), Vector2i(1, 1), Vector2i(2, 1), Vector2i(3, 1),
-			Vector2i(0, 2), Vector2i(1, 2), Vector2i(2, 2), Vector2i(3, 2),
-			Vector2i(1, 3), Vector2i(2, 3)],
-		 "openings": [[Vector2i(1, 0), L], [Vector2i(2, 3), R], [Vector2i(0, 1), L],
-			[Vector2i(0, 2), L], [Vector2i(0, 1), U], [Vector2i(3, 1), U]],
-		 "pigs": [
-			[Vector2i(-1, 0), Vector2i(0, 0), R],
-			[Vector2i(4, 3), Vector2i(3, 3), L],
-			[Vector2i(-2, 1), Vector2i(-1, 1), R],
-			[Vector2i(-2, 2), Vector2i(-1, 2), R],
-			[Vector2i(0, -2), Vector2i(0, -1), D],
-			[Vector2i(3, -1), Vector2i(3, 0), D]]},
-		# 第 10 关:4×4 满填 8 猪,最深依赖链,几乎不容失误。最优 8 步。
-		{"steps": 9, "pen": _rect(4, 4),
-		 "openings": [[Vector2i(0, 0), L], [Vector2i(0, 1), L], [Vector2i(0, 2), L],
-			[Vector2i(0, 3), L], [Vector2i(0, 0), U], [Vector2i(1, 0), U],
-			[Vector2i(2, 3), D], [Vector2i(3, 3), D]],
-		 "pigs": [
-			[Vector2i(-2, 0), Vector2i(-1, 0), R],
-			[Vector2i(-2, 1), Vector2i(-1, 1), R],
-			[Vector2i(-2, 2), Vector2i(-1, 2), R],
-			[Vector2i(-2, 3), Vector2i(-1, 3), R],
-			[Vector2i(0, -2), Vector2i(0, -1), D],
-			[Vector2i(1, -2), Vector2i(1, -1), D],
-			[Vector2i(2, 5), Vector2i(2, 4), U],
-			[Vector2i(3, 5), Vector2i(3, 4), U]]},
+		Vector2i(int(raw[0][0]), int(raw[0][1])),
+		Vector2i(int(raw[1][0]), int(raw[1][1])),
+		Vector2i(int(raw[2][0]), int(raw[2][1])),
 	]
 
 
+static func _parse_opening(raw: Array) -> Array:
+	## raw = [[cx,cy],[dx,dy]]  → [Vector2i, Vector2i]
+	return [
+		Vector2i(int(raw[0][0]), int(raw[0][1])),
+		Vector2i(int(raw[1][0]), int(raw[1][1])),
+	]
+
+
+static func _load_levels_from_json() -> Array:
+	var fa := FileAccess.open("res://levels.json", FileAccess.READ)
+	if fa == null:
+		push_error("无法打开 res://levels.json")
+		return []
+	var text := fa.get_as_text()
+	fa.close()
+
+	var raw = JSON.parse_string(text)
+	if raw == null or not (raw is Array):
+		push_error("levels.json 解析失败")
+		return []
+
+	var result: Array = []
+	for lv_raw in raw:
+		var lv: Dictionary = lv_raw
+
+		var parsed_openings: Array = []
+		for o in lv["openings"]:
+			parsed_openings.append(_parse_opening(o))
+
+		var parsed_pigs: Array = []
+		for p in lv["pigs"]:
+			parsed_pigs.append(_parse_pig(p))
+
+		result.append({
+			"steps": int(lv["steps"]),
+			"pen": _parse_v2i_array(lv["pen"]),
+			"openings": parsed_openings,
+			"pigs": parsed_pigs,
+		})
+	return result
+
+
 func _ready() -> void:
-	levels = _levels()
+	levels = _load_levels_from_json()
+	if levels.is_empty():
+		push_error("levels.json 为空或解析失败,退出")
+		return
+
+	# 读取进度并跳到已解锁的最高关(仅本次运行首次进场;
+	# 之后「从头再玩」等手动切关不再被存档覆盖)
+	if not progress_applied:
+		progress_applied = true
+		level_index = _load_progress()
 	level_index = clampi(level_index, 0, levels.size() - 1)
 
 	_ui_font = SystemFont.new()
@@ -389,6 +353,13 @@ func _win() -> void:
 		var tw := create_tween().set_loops(3)
 		tw.tween_property(pig, "scale", Vector2(1.12, 1.12), 0.15)
 		tw.tween_property(pig, "scale", Vector2.ONE, 0.15)
+
+	# 保存进度
+	var next_idx := level_index + 1
+	var saved := _load_progress()
+	if next_idx > saved:
+		_save_progress(next_idx)
+
 	await get_tree().create_timer(1.0).timeout
 	_advance_on_btn = true
 	if level_index >= levels.size() - 1:

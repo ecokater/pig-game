@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
-"""Verify pigpen puzzle levels: BFS for min moves under slide rules."""
+"""
+Verify pigpen puzzle levels: BFS solver + MC failure rate.
+Reads levels.json from the project root and verifies all 100 levels.
+
+Slide rules (same semantics as main.gd):
+- Pig slides in its direction until:
+  1. head is inside pen AND next is outside pen  (one-way opening: can't exit)
+  2. edge between head and next is a wall
+  3. next is occupied by any other pig
+- Moved 0 cells: not a valid move (no step consumed)
+
+Bounding-box constraint: (pen cells + all pig initial cells) must fit in 10×11 grid.
+"""
+
+import json
+import os
+import sys
+import random
 from collections import deque
 
 R, L, D, U = (1, 0), (-1, 0), (0, 1), (0, -1)
@@ -7,16 +24,20 @@ R, L, D, U = (1, 0), (-1, 0), (0, 1), (0, -1)
 def ekey(a, b):
     return (min(a, b), max(a, b))
 
+def add(a, b):
+    return (a[0]+b[0], a[1]+b[1])
+
 def build(level):
     pen = set(map(tuple, level["pen"]))
     open_edges = set()
-    for c, d in level["openings"]:
-        c = tuple(c); d = tuple(d)
-        open_edges.add(ekey(c, (c[0]+d[0], c[1]+d[1])))
+    for opening in level["openings"]:
+        c = tuple(opening[0]); d = tuple(opening[1])
+        open_edges.add(ekey(c, add(c, d)))
     walls = set()
+    DIRS = [R, L, D, U]
     for c in pen:
-        for d in (R, L, D, U):
-            n = (c[0]+d[0], c[1]+d[1])
+        for d in DIRS:
+            n = add(c, d)
             if n in pen:
                 continue
             k = ekey(c, n)
@@ -26,21 +47,22 @@ def build(level):
 
 def solve(level):
     pen, walls = build(level)
-    pigs = [(tuple(t), tuple(h), tuple(d)) for t, h, d in level["pigs"]]
+    raw_pigs = level["pigs"]
+    pigs = [(tuple(map(int, p[0])), tuple(map(int, p[1])), tuple(map(int, p[2])))
+            for p in raw_pigs]
     dirs = [p[2] for p in pigs]
     init = tuple((p[0], p[1]) for p in pigs)
 
-    # sanity: waiting cells disjoint, outside pen, aimed at an opening
+    # Sanity checks
     cells = []
-    for (t, h) in init:
+    for t, h in init:
         cells += [t, h]
     assert len(set(cells)) == len(cells), "overlapping start pigs"
     for i, (t, h) in enumerate(init):
-        assert t not in pen and h not in pen, f"pig {i} starts inside"
+        assert t not in pen and h not in pen, f"pig {i} starts inside pen"
         d = dirs[i]
-        n = (h[0]+d[0], h[1]+d[1])
-        # 头前方要么直接是开口,要么是圈外通道(允许隔着外部格排队)
-        assert ekey(h, n) not in walls, f"pig {i} aimed at a wall"
+        n = add(h, d)
+        assert ekey(h, n) not in walls, f"pig {i} aimed at a wall (head={h} next={n})"
 
     def try_slide(state, i):
         occ = set()
@@ -51,7 +73,7 @@ def solve(level):
         d = dirs[i]
         moved = 0
         while True:
-            n = (h[0]+d[0], h[1]+d[1])
+            n = add(h, d)
             if h in pen and n not in pen:   # one-way: can't exit
                 break
             if ekey(h, n) in walls:
@@ -60,7 +82,7 @@ def solve(level):
                 break
             t, h = h, n
             moved += 1
-            assert moved < 50
+            assert moved < 100, "infinite slide detected"
         if moved == 0:
             return None
         s = list(state); s[i] = (t, h)
@@ -81,6 +103,8 @@ def solve(level):
                 path.append(i)
                 s = prev
             return depth, list(reversed(path))
+        if depth >= 50:
+            continue
         for i in range(len(pigs)):
             ns = try_slide(state, i)
             if ns is not None and ns not in seen:
@@ -89,81 +113,125 @@ def solve(level):
     return None, None
 
 
-LEVELS = [
-    # 1: 2x2, 2 pigs, trivial
-    dict(name="L1", steps=4,
-         pen=[(x, y) for x in range(2) for y in range(2)],
-         openings=[((0, 0), U), ((1, 0), U)],
-         pigs=[((0, -2), (0, -1), D), ((1, -2), (1, -1), D)]),
-    # 2: 3x2, 3 pigs, mild order
-    dict(name="L2", steps=5,
-         pen=[(x, y) for x in range(3) for y in range(2)],
-         openings=[((0, 1), L), ((0, 0), U), ((2, 0), R)],
-         pigs=[((-2, 1), (-1, 1), R), ((0, -2), (0, -1), D), ((4, 0), (3, 0), L)]),
-    # 3: 4x2, 4 pigs
-    dict(name="L3", steps=6,
-         pen=[(x, y) for x in range(4) for y in range(2)],
-         openings=[((3, 1), D), ((0, 0), L), ((0, 1), L), ((0, 0), U)],
-         pigs=[((3, 3), (3, 2), U), ((-2, 0), (-1, 0), R),
-               ((-2, 1), (-1, 1), R), ((0, -2), (0, -1), D)]),
-    # 4: 3x3 with hole, 4 pigs
-    dict(name="L4", steps=6,
-         pen=[(x, y) for x in range(3) for y in range(3)],
-         openings=[((0, 0), U), ((2, 0), R), ((1, 2), D), ((2, 2), D)],
-         pigs=[((0, -2), (0, -1), D), ((4, 0), (3, 0), L),
-               ((1, 4), (1, 3), U), ((2, 4), (2, 3), U)]),
-    # 5: L-shape 10 cells, 5 pigs
-    dict(name="L5", steps=7,
-         pen=[(x, y) for x in range(3) for y in range(2)] + [(0, 2), (1, 2), (0, 3), (1, 3)],
-         openings=[((2, 0), U), ((0, 0), L), ((0, 1), L), ((0, 3), D), ((1, 3), D)],
-         pigs=[((2, -2), (2, -1), D), ((-2, 0), (-1, 0), R), ((-2, 1), (-1, 1), R),
-               ((0, 5), (0, 4), U), ((1, 5), (1, 4), U)]),
-    # 6: 4x3, 6 pigs (original level)
-    dict(name="L6", steps=8,
-         pen=[(x, y) for x in range(4) for y in range(3)],
-         openings=[((0, 0), L), ((0, 2), L), ((1, 0), U), ((3, 0), U), ((0, 2), D), ((2, 2), D)],
-         pigs=[((-2, 0), (-1, 0), R), ((-2, 2), (-1, 2), R), ((1, -2), (1, -1), D),
-               ((3, -2), (3, -1), D), ((0, 4), (0, 3), U), ((2, 4), (2, 3), U)]),
-    # 7: 4x3, 6 pigs, long dependency chain
-    dict(name="L7", steps=7,
-         pen=[(x, y) for x in range(4) for y in range(3)],
-         openings=[((0, 0), L), ((0, 0), U), ((1, 0), U), ((0, 2), L), ((2, 2), D), ((3, 2), D)],
-         pigs=[((-2, 0), (-1, 0), R), ((0, -2), (0, -1), D), ((1, -2), (1, -1), D),
-               ((-2, 2), (-1, 2), R), ((2, 4), (2, 3), U), ((3, 4), (3, 3), U)]),
-    # 8: 4x3 block + top-left arm (14 cells), 7 pigs
-    dict(name="L8", steps=8,
-         pen=[(0, 0), (1, 0)] + [(x, y) for x in range(4) for y in range(1, 4)],
-         openings=[((0, 0), L), ((0, 3), D), ((0, 3), L), ((1, 3), D),
-                   ((3, 1), R), ((2, 3), D), ((3, 3), D)],
-         pigs=[((-2, 0), (-1, 0), R), ((0, 5), (0, 4), U), ((-2, 3), (-1, 3), R),
-               ((1, 5), (1, 4), U), ((5, 1), (4, 1), L), ((2, 5), (2, 4), U),
-               ((3, 5), (3, 4), U)]),
-    # 9: plus shape (4x4 minus corners), 6 pigs
-    dict(name="L9", steps=7,
-         pen=[(1, 0), (2, 0), (0, 1), (1, 1), (2, 1), (3, 1),
-              (0, 2), (1, 2), (2, 2), (3, 2), (1, 3), (2, 3)],
-         openings=[((1, 0), L), ((2, 3), R), ((0, 1), L), ((0, 2), L),
-                   ((0, 1), U), ((3, 1), U)],
-         pigs=[((-1, 0), (0, 0), R), ((4, 3), (3, 3), L), ((-2, 1), (-1, 1), R),
-               ((-2, 2), (-1, 2), R), ((0, -2), (0, -1), D), ((3, -1), (3, 0), D)]),
-    # 10: 4x4, 8 pigs, deep chain
-    dict(name="L10", steps=9,
-         pen=[(x, y) for x in range(4) for y in range(4)],
-         openings=[((0, 0), L), ((0, 1), L), ((0, 2), L), ((0, 3), L),
-                   ((0, 0), U), ((1, 0), U), ((2, 3), D), ((3, 3), D)],
-         pigs=[((-2, 0), (-1, 0), R), ((-2, 1), (-1, 1), R), ((-2, 2), (-1, 2), R),
-               ((-2, 3), (-1, 3), R), ((0, -2), (0, -1), D), ((1, -2), (1, -1), D),
-               ((2, 5), (2, 4), U), ((3, 5), (3, 4), U)]),
-]
+def monte_carlo(level, budget, n_sims=2000, seed=42):
+    pen, walls = build(level)
+    raw_pigs = level["pigs"]
+    pigs = [(tuple(map(int, p[0])), tuple(map(int, p[1])), tuple(map(int, p[2])))
+            for p in raw_pigs]
+    dirs = [p[2] for p in pigs]
+    n = len(pigs)
+    rng = random.Random(seed)
 
-for lv in LEVELS:
-    try:
-        m, path = solve(lv)
-    except AssertionError as e:
-        print(f'{lv["name"]}: INVALID - {e}')
-        continue
-    if m is None:
-        print(f'{lv["name"]}: UNSOLVABLE')
+    def try_slide(state, i):
+        occ = set()
+        for j, (t, h) in enumerate(state):
+            if j != i:
+                occ.add(t); occ.add(h)
+        t, h = state[i]; d = dirs[i]; moved = 0
+        while True:
+            nx = add(h, d)
+            if h in pen and nx not in pen: break
+            if ekey(h, nx) in walls: break
+            if nx in occ: break
+            t, h = h, nx; moved += 1
+            if moved >= 100: break
+        if moved == 0: return None
+        s = list(state); s[i] = (t, h); return tuple(s)
+
+    def won(state):
+        return all(t in pen and h in pen for t, h in state)
+
+    init = tuple((p[0], p[1]) for p in pigs)
+    failures = 0
+    for _ in range(n_sims):
+        state = init; steps = 0
+        while steps < budget:
+            movable = [i for i in range(n) if try_slide(state, i) is not None]
+            if not movable: break
+            i = rng.choice(movable)
+            ns = try_slide(state, i)
+            if ns is None: break
+            state = ns; steps += 1
+            if won(state): break
+        if not won(state): failures += 1
+    return failures / n_sims
+
+
+def check_bbox(level, max_cols=10, max_rows=11):
+    """Check bounding box constraint."""
+    all_cells = list(map(tuple, level["pen"]))
+    for p in level["pigs"]:
+        all_cells.append(tuple(p[0]))
+        all_cells.append(tuple(p[1]))
+    xs = [c[0] for c in all_cells]
+    ys = [c[1] for c in all_cells]
+    cols = max(xs) - min(xs) + 1
+    rows = max(ys) - min(ys) + 1
+    return cols <= max_cols and rows <= max_rows, cols, rows
+
+
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+    levels_path = os.path.join(project_root, 'levels.json')
+
+    if not os.path.exists(levels_path):
+        print(f"ERROR: levels.json not found at {levels_path}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(levels_path, 'r', encoding='utf-8') as f:
+        levels = json.load(f)
+
+    print(f"Verifying {len(levels)} levels from {levels_path}")
+    print("=" * 80)
+    print(f"{'#':<5} {'pigs':>4} {'min':>4} {'budget':>7} {'slack':>6} "
+          f"{'mc_fail':>8} {'bbox':>8}  status")
+    print("-" * 80)
+
+    all_ok = True
+    for idx, lv in enumerate(levels):
+        name = f"L{idx+1:03d}"
+        n_pigs = len(lv['pigs'])
+
+        # Bounding box check
+        bbox_pass, cols, rows = check_bbox(lv)
+        if not bbox_pass:
+            print(f"{name}: BBOX FAIL  {cols}x{rows} (max 10x11)")
+            all_ok = False
+            continue
+
+        try:
+            m, path = solve(lv)
+        except AssertionError as e:
+            print(f"{name}: INVALID - {e}")
+            all_ok = False
+            continue
+        except Exception as e:
+            print(f"{name}: ERROR - {e}")
+            all_ok = False
+            continue
+
+        if m is None:
+            print(f"{name}: UNSOLVABLE (budget={lv['steps']})")
+            all_ok = False
+        elif m > lv['steps']:
+            print(f"{name}: STEPS TOO LOW  min={m}  budget={lv['steps']}  path={path}")
+            all_ok = False
+        else:
+            slack = lv['steps'] - m
+            # MC failure rate (fast, 500 sims during verify)
+            mc = monte_carlo(lv, lv['steps'], n_sims=500, seed=idx * 17 + 42)
+            bbox_str = f"{cols}x{rows}"
+            print(f"{name}: OK  pigs={n_pigs:2d}  min={m:2d}  budget={lv['steps']:2d}  "
+                  f"slack={slack}  mc_fail={mc:6.1%}  bbox={bbox_str}")
+
+    print("=" * 80)
+    if all_ok:
+        print(f"ALL {len(levels)} LEVELS OK")
     else:
-        ok = "OK " if m <= lv["steps"] else "STEPS TOO LOW"
-        print(f'{lv["name"]}: min={m} budget={lv["steps"]} {ok} path={path}')
+        print("SOME LEVELS FAILED")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
