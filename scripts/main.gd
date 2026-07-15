@@ -3,6 +3,9 @@ extends Node2D
 ## 小猪占两格、在开口外等待,点击后沿固定方向滑入猪圈,
 ## 撞到栅栏或其他小猪即停下;开口只进不出。
 ## 在限定步数内全部进圈则过关。
+##
+## Meta 层(状态在 Meta 单例):红心体力、金币、三星评级、连胜、
+## 道具(撤销/提示/+2步)、步数耗尽续关、皮肤、每日奖励。
 
 const VIEW := Vector2(1024.0, 1280.0)
 const PLAY_AREA := Rect2(16.0, 170.0, 992.0, 1050.0)
@@ -28,6 +31,8 @@ var levels: Array = []
 var cell_size := BASE_CELL
 var grid_origin := Vector2.ZERO
 var max_steps := 0
+var min_steps := 0         # 本关最优步数(星级评价用)
+var moves_made := 0
 
 var pen_cells: Array = []
 var openings: Array = []   # [圈内格子, 朝外方向]
@@ -43,13 +48,26 @@ var game_over := false
 var animating := false
 var bear: Node2D
 
+var _undo_stack: Array = []
+var _hint_seq: Array = []  # 缓存的最优点击序列(猪下标);玩家偏离即失效
+
 var _title: Label
 var _steps_label: Label
+var _hearts_label: Label
+var _coins_label: Label
+var _streak_label: Label
 var _panel: CenterContainer
 var _select_panel: ColorRect
+var _shop_panel: ColorRect
+var _shop_box: VBoxContainer
 var _result_label: Label
 var _btn: Button
-var _advance_on_btn := false
+var _btn2: Button
+var _btn_mode := "retry"   # advance / retry / continue
+var _undo_btn: Button
+var _hint_btn: Button
+var _steps_btn: Button
+var _toast_label: Label
 var _grass: PackedVector2Array = PackedVector2Array()
 var _ui_font: SystemFont
 
@@ -123,6 +141,7 @@ static func _load_levels_from_json() -> Array:
 
 		result.append({
 			"steps": int(lv["steps"]),
+			"min": int(lv.get("min", lv["steps"])),
 			"pen": _parse_v2i_array(lv["pen"]),
 			"openings": parsed_openings,
 			"pigs": parsed_pigs,
@@ -162,6 +181,13 @@ func _ready() -> void:
 	_spawn_bear()
 	_build_ui()
 
+	# 每日奖励(每天首次启动)
+	if Meta.daily_pending:
+		var got: int = Meta.claim_daily()
+		_toast("每日奖励:+%d🪙 · 提示×1" % got)
+		_refresh_topbar()
+		_refresh_boosters()
+
 
 # ---------- 关卡装载 ----------
 
@@ -170,7 +196,9 @@ func _load_level(lv: Dictionary) -> void:
 	openings = lv["openings"]
 	pig_defs = lv["pigs"]
 	max_steps = lv["steps"]
+	min_steps = lv["min"]
 	steps_left = max_steps
+	moves_made = 0
 
 	cellset.clear()
 	for c in pen_cells:
@@ -231,6 +259,7 @@ func _spawn_pigs() -> void:
 		var spr := Sprite2D.new()
 		spr.name = "Sprite"
 		spr.texture = PIG_TEX
+		spr.modulate = Meta.skin_tint()
 		pig.add_child(spr)
 		add_child(pig)
 		pigs.append(pig)
@@ -280,6 +309,10 @@ func is_inside(c: Vector2i) -> bool:
 	return cellset.has(c)
 
 
+func meta_tint() -> Color:
+	return Meta.skin_tint()
+
+
 # ---------- 输入与移动 ----------
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -295,6 +328,11 @@ func _unhandled_input(event: InputEvent) -> void:
 
 
 func _tap_pig(pig: Node2D) -> void:
+	# 移动前快照,供撤销道具回滚
+	var snap := {"steps": steps_left, "moves": moves_made, "pigs": []}
+	for pg in pigs:
+		snap["pigs"].append([pg, pg.tail, pg.head])
+
 	var moved := 0
 	while moved < 64:
 		var next: Vector2i = pig.head + pig.dir
@@ -314,7 +352,17 @@ func _tap_pig(pig: Node2D) -> void:
 		pig.wiggle()
 		return
 
+	_undo_stack.append(snap)
+	# 提示缓存:按提示点了就前进一步,偏离则作废
+	var idx := pigs.find(pig)
+	if not _hint_seq.is_empty():
+		if int(_hint_seq[0]) == idx:
+			_hint_seq.pop_front()
+		else:
+			_hint_seq.clear()
+
 	steps_left -= 1
+	moves_made += 1
 	_update_steps_label()
 	animating = true
 	await pig.slide_to_cells(0.12 + 0.05 * moved)
@@ -348,6 +396,130 @@ func _check_state() -> void:
 		_fail()
 
 
+# ---------- 道具:撤销 / 提示 / 加步 ----------
+
+func _do_undo() -> void:
+	if game_over or animating or _undo_stack.is_empty():
+		return
+	if not Meta.use_booster("undo"):
+		_toast("金币不足")
+		return
+	var snap: Dictionary = _undo_stack.pop_back()
+	occupied.clear()
+	for e in snap["pigs"]:
+		var pg: Node2D = e[0]
+		pg.tail = e[1]
+		pg.head = e[2]
+		occupied[pg.tail] = pg
+		occupied[pg.head] = pg
+		pg.position = pg.center_pos()
+	steps_left = snap["steps"]
+	moves_made = snap["moves"]
+	_hint_seq.clear()
+	_update_steps_label()
+	_refresh_topbar()
+	_refresh_boosters()
+
+
+func _do_hint() -> void:
+	if game_over or animating:
+		return
+	if _hint_seq.is_empty():
+		var seq = _solve_from_current()
+		if seq == null or (seq as Array).is_empty():
+			_toast("当前局面在剩余步数内已无解,试试撤销")
+			return
+		_hint_seq = seq
+	if not Meta.use_booster("hint"):
+		_toast("金币不足")
+		return
+	pigs[int(_hint_seq[0])].flash()
+	_refresh_topbar()
+	_refresh_boosters()
+
+
+func _do_extra_steps() -> void:
+	if game_over or animating:
+		return
+	if not Meta.use_booster("steps"):
+		_toast("金币不足")
+		return
+	steps_left += 2
+	_update_steps_label()
+	_refresh_topbar()
+	_refresh_boosters()
+
+
+# ---------- 实时求解(提示道具用) ----------
+## 与关卡生成器同一套规则的 DFS:从当前局面找一条剩余步数内的通关序列。
+## 记忆化按「局面 + 剩余步数下界」剪枝,找到第一条解即返回。
+
+func _solve_from_current() -> Variant:
+	var st: Array = []
+	var occ := {}
+	for pig in pigs:
+		st.append([pig.tail, pig.head])
+		occ[pig.tail] = true
+		occ[pig.head] = true
+	var visited := {}
+	return _dfs(st, occ, steps_left, visited)
+
+
+func _dfs(st: Array, occ: Dictionary, remaining: int, visited: Dictionary) -> Variant:
+	var done := true
+	for p in st:
+		if not (is_inside(p[0]) and is_inside(p[1])):
+			done = false
+			break
+	if done:
+		return []
+	if remaining <= 0:
+		return null
+	var key := _state_key(st)
+	if int(visited.get(key, -1)) >= remaining:
+		return null
+	visited[key] = remaining
+
+	for i in st.size():
+		var nst: Array = st.duplicate(true)
+		var nocc: Dictionary = occ.duplicate()
+		if _sim_slide(nst, nocc, i) == 0:
+			continue
+		var sub = _dfs(nst, nocc, remaining - 1, visited)
+		if sub != null:
+			var path: Array = sub
+			path.insert(0, i)
+			return path
+	return null
+
+
+func _sim_slide(st: Array, occ: Dictionary, i: int) -> int:
+	var dir: Vector2i = pigs[i].dir
+	var moved := 0
+	while moved < 64:
+		var head: Vector2i = st[i][1]
+		var next: Vector2i = head + dir
+		if is_inside(head) and not is_inside(next):
+			break
+		if walls.has(_edge_key(head, next)):
+			break
+		if occ.has(next):
+			break
+		occ.erase(st[i][0])
+		st[i][0] = head
+		st[i][1] = next
+		occ[next] = true
+		moved += 1
+	return moved
+
+
+func _state_key(st: Array) -> String:
+	var s := ""
+	for p in st:
+		s += "%d,%d,%d,%d;" % [p[0].x, p[0].y, p[1].x, p[1].y]
+	return s
+
+
 # ---------- 胜负 ----------
 
 func _win() -> void:
@@ -358,6 +530,14 @@ func _win() -> void:
 		tw.tween_property(pig, "scale", Vector2(1.12, 1.12), 0.15)
 		tw.tween_property(pig, "scale", Vector2.ONE, 0.15)
 
+	# 星级:最优步数 3★,多 1 步 2★,过关 1★
+	var star_cnt := 1
+	if moves_made <= min_steps:
+		star_cnt = 3
+	elif moves_made <= min_steps + 1:
+		star_cnt = 2
+	var reward: Dictionary = Meta.record_win(level_index, star_cnt)
+
 	# 保存进度
 	var next_idx := level_index + 1
 	var saved := _load_progress()
@@ -365,18 +545,44 @@ func _win() -> void:
 		_save_progress(next_idx)
 
 	await get_tree().create_timer(1.0).timeout
-	_advance_on_btn = true
+	var lines := "%s\n+%d🪙" % ["★".repeat(star_cnt) + "☆".repeat(3 - star_cnt), reward["coins"]]
+	if int(reward["streak"]) >= 2:
+		lines += "   🔥连胜 %d" % reward["streak"]
+	if reward["bonus_booster"] != "":
+		var names := {"undo": "撤销", "hint": "提示", "steps": "+2步"}
+		lines += "\n连胜奖励:%s道具 ×1" % names[reward["bonus_booster"]]
+	_btn_mode = "advance"
 	if level_index >= levels.size() - 1:
-		_result_label.text = "恭喜，全部通关！"
+		_result_label.text = "恭喜，全部通关！\n" + lines
 		_btn.text = "从头再玩"
 	else:
-		_result_label.text = "过关啦！"
+		_result_label.text = "过关啦！\n" + lines
 		_btn.text = "下一关"
+	_btn.disabled = false
+	_btn2.visible = false
+	_refresh_topbar()
 	_panel.visible = true
 
 
 func _fail() -> void:
 	game_over = true
+	# 步数耗尽但仍有路可走 → 续关报价(Candy Crush 式)
+	if steps_left <= 0 and _any_move_possible():
+		_btn_mode = "continue"
+		_result_label.text = "步数用完了！"
+		_btn.text = "+2 步继续（%d🪙）" % Meta.CONTINUE_PRICE
+		_btn.disabled = Meta.coins < Meta.CONTINUE_PRICE
+		_btn2.text = "放弃"
+		_btn2.visible = true
+		_panel.visible = true
+		return
+	_do_fail()
+
+
+func _do_fail() -> void:
+	game_over = true
+	Meta.record_fail()
+	_refresh_topbar()
 	_title.text = "糟糕…"
 	var victim: Node2D = null
 	for pig in pigs:
@@ -396,19 +602,44 @@ func _fail() -> void:
 		_spawn_cloud(victim.position)
 		_spawn_cross(victim.position + Vector2(140, -60))
 		await get_tree().create_timer(1.4).timeout
-	_advance_on_btn = false
+	_btn_mode = "retry"
 	_result_label.text = "小猪被熊抓走了…"
-	_btn.text = "再试一次"
+	if Meta.can_play():
+		_btn.text = "再试一次"
+		_btn.disabled = false
+	else:
+		_btn.text = "❤ 回复中 %s" % Meta.heart_wait_text()
+		_btn.disabled = true
+	_btn2.visible = false
 	_panel.visible = true
 
 
 func _on_btn_pressed() -> void:
-	if _advance_on_btn:
-		if level_index < levels.size() - 1:
-			level_index += 1
-		else:
-			level_index = 0
+	match _btn_mode:
+		"continue":
+			if Meta.try_spend(Meta.CONTINUE_PRICE):
+				game_over = false
+				steps_left += 2
+				_hint_seq.clear()
+				_panel.visible = false
+				_update_steps_label()
+				_refresh_topbar()
+			return
+		"advance":
+			if level_index < levels.size() - 1:
+				level_index += 1
+			else:
+				level_index = 0
+		"retry":
+			if not Meta.can_play():
+				return
 	get_tree().reload_current_scene()
+
+
+func _on_btn2_pressed() -> void:
+	# 放弃续关 → 走正常失败流程
+	_panel.visible = false
+	_do_fail()
 
 
 # ---------- 特效 ----------
@@ -445,6 +676,32 @@ func _update_steps_label() -> void:
 	_steps_label.text = "第 %d / %d 关 · 剩余步数：%d" % [level_index + 1, levels.size(), steps_left]
 
 
+func _refresh_topbar() -> void:
+	Meta.tick_hearts()
+	var h := "❤ %d/%d" % [Meta.hearts, Meta.MAX_HEARTS]
+	var wait := Meta.heart_wait_text()
+	if wait != "":
+		h += "（%s）" % wait
+	_hearts_label.text = h
+	_coins_label.text = "🪙 %d" % Meta.coins
+	_streak_label.text = "🔥 %d" % Meta.streak
+	_streak_label.visible = Meta.streak >= 2
+
+
+func _refresh_boosters() -> void:
+	_undo_btn.text = "↩ 撤销 %s" % Meta.booster_label("undo")
+	_hint_btn.text = "💡 提示 %s" % Meta.booster_label("hint")
+	_steps_btn.text = "➕ 2步 %s" % Meta.booster_label("steps")
+
+
+func _toast(msg: String) -> void:
+	_toast_label.text = msg
+	_toast_label.modulate.a = 1.0
+	var tw := create_tween()
+	tw.tween_interval(1.8)
+	tw.tween_property(_toast_label, "modulate:a", 0.0, 0.6)
+
+
 func _build_ui() -> void:
 	var ui := CanvasLayer.new()
 	add_child(ui)
@@ -467,12 +724,77 @@ func _build_ui() -> void:
 
 	var hint := Label.new()
 	hint.text = "点击小猪让它冲进猪圈 · 顺序很重要！"
-	_style_label(hint, 28, Color(1, 1, 1, 0.9))
+	_style_label(hint, 26, Color(1, 1, 1, 0.9))
 	hint.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
-	hint.offset_top = -58.0
-	hint.offset_bottom = -14.0
+	hint.offset_top = -50.0
+	hint.offset_bottom = -10.0
 	ui.add_child(hint)
 
+	# ── 顶栏:红心 / 金币 / 连胜 ──
+	_hearts_label = Label.new()
+	_style_label(_hearts_label, 30, Color(1, 0.85, 0.85))
+	_hearts_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	_hearts_label.set_anchors_and_offsets_preset(Control.PRESET_TOP_LEFT)
+	_hearts_label.offset_left = 178.0
+	_hearts_label.offset_top = 28.0
+	_hearts_label.offset_right = 470.0
+	_hearts_label.offset_bottom = 72.0
+	ui.add_child(_hearts_label)
+
+	_coins_label = Label.new()
+	_style_label(_coins_label, 30, Color(1, 0.95, 0.6))
+	_coins_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_coins_label.set_anchors_and_offsets_preset(Control.PRESET_TOP_RIGHT)
+	_coins_label.offset_left = -300.0
+	_coins_label.offset_top = 28.0
+	_coins_label.offset_right = -22.0
+	_coins_label.offset_bottom = 72.0
+	ui.add_child(_coins_label)
+
+	_streak_label = Label.new()
+	_style_label(_streak_label, 30, Color(1, 0.7, 0.35))
+	_streak_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_streak_label.set_anchors_and_offsets_preset(Control.PRESET_TOP_RIGHT)
+	_streak_label.offset_left = -300.0
+	_streak_label.offset_top = 78.0
+	_streak_label.offset_right = -22.0
+	_streak_label.offset_bottom = 120.0
+	ui.add_child(_streak_label)
+
+	# 红心计时每秒刷新
+	var timer := Timer.new()
+	timer.wait_time = 1.0
+	timer.autostart = true
+	timer.timeout.connect(_refresh_topbar)
+	ui.add_child(timer)
+
+	# ── 道具栏 ──
+	var bar := HBoxContainer.new()
+	bar.alignment = BoxContainer.ALIGNMENT_CENTER
+	bar.add_theme_constant_override("separation", 22)
+	bar.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
+	bar.offset_top = -156.0
+	bar.offset_bottom = -62.0
+	ui.add_child(bar)
+
+	_undo_btn = _make_booster_btn(_do_undo)
+	bar.add_child(_undo_btn)
+	_hint_btn = _make_booster_btn(_do_hint)
+	bar.add_child(_hint_btn)
+	_steps_btn = _make_booster_btn(_do_extra_steps)
+	bar.add_child(_steps_btn)
+	_refresh_boosters()
+
+	# ── 提示浮层 ──
+	_toast_label = Label.new()
+	_style_label(_toast_label, 32, Color(1, 1, 1))
+	_toast_label.set_anchors_and_offsets_preset(Control.PRESET_TOP_WIDE)
+	_toast_label.offset_top = 152.0
+	_toast_label.offset_bottom = 200.0
+	_toast_label.modulate.a = 0.0
+	ui.add_child(_toast_label)
+
+	# ── 结算面板 ──
 	_panel = CenterContainer.new()
 	_panel.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_panel.visible = false
@@ -487,27 +809,35 @@ func _build_ui() -> void:
 	_panel.add_child(box)
 
 	var v := VBoxContainer.new()
-	v.add_theme_constant_override("separation", 34)
+	v.add_theme_constant_override("separation", 30)
 	v.alignment = BoxContainer.ALIGNMENT_CENTER
 	box.add_child(v)
 
 	_result_label = Label.new()
-	_style_label(_result_label, 56, Color(0.24, 0.16, 0.1))
+	_style_label(_result_label, 48, Color(0.24, 0.16, 0.1))
 	_result_label.add_theme_constant_override("outline_size", 0)
 	v.add_child(_result_label)
 
 	_btn = Button.new()
-	_btn.custom_minimum_size = Vector2(320, 96)
+	_btn.custom_minimum_size = Vector2(420, 92)
 	_btn.add_theme_font_override("font", _ui_font)
-	_btn.add_theme_font_size_override("font_size", 40)
+	_btn.add_theme_font_size_override("font_size", 36)
 	_btn.pressed.connect(_on_btn_pressed)
 	v.add_child(_btn)
 
+	_btn2 = Button.new()
+	_btn2.custom_minimum_size = Vector2(420, 72)
+	_btn2.add_theme_font_override("font", _ui_font)
+	_btn2.add_theme_font_size_override("font_size", 30)
+	_btn2.visible = false
+	_btn2.pressed.connect(_on_btn2_pressed)
+	v.add_child(_btn2)
+
 	var panel_sel := Button.new()
 	panel_sel.text = "选关"
-	panel_sel.custom_minimum_size = Vector2(320, 72)
+	panel_sel.custom_minimum_size = Vector2(420, 64)
 	panel_sel.add_theme_font_override("font", _ui_font)
-	panel_sel.add_theme_font_size_override("font_size", 32)
+	panel_sel.add_theme_font_size_override("font_size", 28)
 	panel_sel.pressed.connect(_toggle_select)
 	v.add_child(panel_sel)
 
@@ -525,6 +855,17 @@ func _build_ui() -> void:
 	ui.add_child(sel_btn)
 
 	_build_select_panel(ui)
+	_build_shop_panel(ui)
+	_refresh_topbar()
+
+
+func _make_booster_btn(action: Callable) -> Button:
+	var b := Button.new()
+	b.custom_minimum_size = Vector2(250, 86)
+	b.add_theme_font_override("font", _ui_font)
+	b.add_theme_font_size_override("font_size", 27)
+	b.pressed.connect(action)
+	return b
 
 
 func _build_select_panel(ui: CanvasLayer) -> void:
@@ -557,14 +898,14 @@ func _build_select_panel(ui: CanvasLayer) -> void:
 	box.add_child(v)
 
 	var head := Label.new()
-	head.text = "选择关卡（已解锁 %d / %d）" % [
-		mini(unlocked + 1, levels.size()), levels.size()]
-	_style_label(head, 40, Color(0.24, 0.16, 0.1))
+	head.text = "选择关卡（已解锁 %d / %d · ★ %d）" % [
+		mini(unlocked + 1, levels.size()), levels.size(), Meta.total_stars()]
+	_style_label(head, 36, Color(0.24, 0.16, 0.1))
 	head.add_theme_constant_override("outline_size", 0)
 	v.add_child(head)
 
 	var scroll := ScrollContainer.new()
-	scroll.custom_minimum_size = Vector2(910, 780)
+	scroll.custom_minimum_size = Vector2(910, 740)
 	v.add_child(scroll)
 
 	var grid := GridContainer.new()
@@ -575,29 +916,143 @@ func _build_select_panel(ui: CanvasLayer) -> void:
 
 	for i in levels.size():
 		var b := Button.new()
-		b.text = str(i + 1)
-		b.custom_minimum_size = Vector2(82, 70)
+		var s := Meta.level_stars(i)
+		b.text = str(i + 1) + ("\n" + "★".repeat(s) if s > 0 else "")
+		b.custom_minimum_size = Vector2(82, 74)
 		b.add_theme_font_override("font", _ui_font)
-		b.add_theme_font_size_override("font_size", 26)
+		b.add_theme_font_size_override("font_size", 22)
 		if i > unlocked:
 			b.disabled = true
 			b.text = "🔒"
 		elif i == level_index:
 			b.add_theme_color_override("font_color", Color("#d9781f"))
-			b.add_theme_font_size_override("font_size", 30)
 		b.pressed.connect(_goto_level.bind(i))
 		grid.add_child(b)
+
+	var hb := HBoxContainer.new()
+	hb.alignment = BoxContainer.ALIGNMENT_CENTER
+	hb.add_theme_constant_override("separation", 24)
+	v.add_child(hb)
+
+	var shop := Button.new()
+	shop.text = "🐷 小猪装扮"
+	shop.custom_minimum_size = Vector2(260, 64)
+	shop.add_theme_font_override("font", _ui_font)
+	shop.add_theme_font_size_override("font_size", 28)
+	shop.pressed.connect(func() -> void:
+		_select_panel.visible = false
+		_populate_shop()
+		_shop_panel.visible = true)
+	hb.add_child(shop)
 
 	var close := Button.new()
 	close.text = "关闭"
 	close.custom_minimum_size = Vector2(200, 64)
 	close.add_theme_font_override("font", _ui_font)
-	close.add_theme_font_size_override("font_size", 30)
+	close.add_theme_font_size_override("font_size", 28)
 	close.pressed.connect(func() -> void: _select_panel.visible = false)
+	hb.add_child(close)
+
+
+# ---------- 皮肤商店 ----------
+
+func _build_shop_panel(ui: CanvasLayer) -> void:
+	_shop_panel = ColorRect.new()
+	_shop_panel.color = Color(0, 0, 0, 0.55)
+	_shop_panel.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_shop_panel.visible = false
+	_shop_panel.gui_input.connect(func(ev: InputEvent) -> void:
+		if ev is InputEventMouseButton and ev.pressed:
+			_shop_panel.visible = false)
+	ui.add_child(_shop_panel)
+
+	var cc := CenterContainer.new()
+	cc.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	cc.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_shop_panel.add_child(cc)
+
+	var box := PanelContainer.new()
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(1, 1, 1, 0.97)
+	style.set_corner_radius_all(24)
+	style.set_content_margin_all(34.0)
+	box.add_theme_stylebox_override("panel", style)
+	cc.add_child(box)
+
+	_shop_box = VBoxContainer.new()
+	_shop_box.add_theme_constant_override("separation", 16)
+	box.add_child(_shop_box)
+
+
+func _populate_shop() -> void:
+	for child in _shop_box.get_children():
+		child.queue_free()
+
+	var head := Label.new()
+	head.text = "小猪装扮（🪙 %d）" % Meta.coins
+	_style_label(head, 36, Color(0.24, 0.16, 0.1))
+	head.add_theme_constant_override("outline_size", 0)
+	_shop_box.add_child(head)
+
+	for id in Meta.SKINS:
+		var info: Dictionary = Meta.SKINS[id]
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 20)
+		_shop_box.add_child(row)
+
+		var swatch := ColorRect.new()
+		swatch.color = Color(1.0, 0.63, 0.72) * info["tint"]
+		swatch.custom_minimum_size = Vector2(52, 52)
+		row.add_child(swatch)
+
+		var name_l := Label.new()
+		name_l.text = info["name"]
+		_style_label(name_l, 30, Color(0.24, 0.16, 0.1))
+		name_l.add_theme_constant_override("outline_size", 0)
+		name_l.custom_minimum_size = Vector2(240, 0)
+		name_l.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+		row.add_child(name_l)
+
+		var act := Button.new()
+		act.custom_minimum_size = Vector2(220, 60)
+		act.add_theme_font_override("font", _ui_font)
+		act.add_theme_font_size_override("font_size", 26)
+		if Meta.skin == id:
+			act.text = "使用中"
+			act.disabled = true
+		elif Meta.owned_skins.has(id):
+			act.text = "使用"
+			act.pressed.connect(func() -> void:
+				Meta.select_skin(id)
+				_apply_skin()
+				_populate_shop())
+		else:
+			act.text = "%d🪙" % int(info["price"])
+			act.pressed.connect(func() -> void:
+				if Meta.buy_skin(id):
+					Meta.select_skin(id)
+					_apply_skin()
+					_refresh_topbar()
+					_populate_shop()
+				else:
+					_toast("金币不足"))
+		row.add_child(act)
+
+	var close := Button.new()
+	close.text = "关闭"
+	close.custom_minimum_size = Vector2(200, 60)
+	close.add_theme_font_override("font", _ui_font)
+	close.add_theme_font_size_override("font_size", 28)
+	close.pressed.connect(func() -> void: _shop_panel.visible = false)
 	var hb := HBoxContainer.new()
 	hb.alignment = BoxContainer.ALIGNMENT_CENTER
 	hb.add_child(close)
-	v.add_child(hb)
+	_shop_box.add_child(hb)
+
+
+func _apply_skin() -> void:
+	for pig in pigs:
+		pig.get_node("Sprite").modulate = Meta.skin_tint()
 
 
 func _toggle_select() -> void:

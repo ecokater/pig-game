@@ -42,6 +42,13 @@ func slide_to_cells(dur: float) -> void:
 	await tw.finished
 
 
+func flash() -> void:
+	## 提示高亮:亮黄闪三下
+	var tw := create_tween().set_loops(3)
+	tw.tween_property(_sprite, "modulate", Color(1.6, 1.5, 0.6), 0.16)
+	tw.tween_property(_sprite, "modulate", main.meta_tint(), 0.16)
+
+
 func wiggle() -> void:
 	if _wiggling:
 		return

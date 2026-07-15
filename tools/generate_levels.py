@@ -755,6 +755,7 @@ def main():
         a = cand['an'][sl]
         levels_json.append({
             'steps': budget,
+            'min': cand['min_steps'],
             'pen': [list(c) for c in pen],
             'openings': [[list(c), list(d)] for c, d in openings],
             'pigs': [[list(t), list(h), list(d)] for t, h, d in pigs],
