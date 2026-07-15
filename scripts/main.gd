@@ -21,6 +21,9 @@ const CROSS_TEX := preload("res://art/cross.svg")
 static var level_index := 0
 static var progress_applied := false  # 存档只在本次运行首次进场时应用
 
+## 测试开关:true 时选关面板解锁全部关卡(不影响存档)。发布前改回 false。
+const UNLOCK_ALL := true
+
 var levels: Array = []
 var cell_size := BASE_CELL
 var grid_origin := Vector2.ZERO
@@ -43,6 +46,7 @@ var bear: Node2D
 var _title: Label
 var _steps_label: Label
 var _panel: CenterContainer
+var _select_panel: ColorRect
 var _result_label: Label
 var _btn: Button
 var _advance_on_btn := false
@@ -498,6 +502,111 @@ func _build_ui() -> void:
 	_btn.add_theme_font_size_override("font_size", 40)
 	_btn.pressed.connect(_on_btn_pressed)
 	v.add_child(_btn)
+
+	var panel_sel := Button.new()
+	panel_sel.text = "选关"
+	panel_sel.custom_minimum_size = Vector2(320, 72)
+	panel_sel.add_theme_font_override("font", _ui_font)
+	panel_sel.add_theme_font_size_override("font_size", 32)
+	panel_sel.pressed.connect(_toggle_select)
+	v.add_child(panel_sel)
+
+	# 左上角常驻选关按钮
+	var sel_btn := Button.new()
+	sel_btn.text = "☰ 选关"
+	sel_btn.add_theme_font_override("font", _ui_font)
+	sel_btn.add_theme_font_size_override("font_size", 28)
+	sel_btn.set_anchors_and_offsets_preset(Control.PRESET_TOP_LEFT)
+	sel_btn.offset_left = 18.0
+	sel_btn.offset_top = 22.0
+	sel_btn.offset_right = 160.0
+	sel_btn.offset_bottom = 78.0
+	sel_btn.pressed.connect(_toggle_select)
+	ui.add_child(sel_btn)
+
+	_build_select_panel(ui)
+
+
+func _build_select_panel(ui: CanvasLayer) -> void:
+	var unlocked := levels.size() - 1 if UNLOCK_ALL else _load_progress()
+
+	_select_panel = ColorRect.new()
+	_select_panel.color = Color(0, 0, 0, 0.55)
+	_select_panel.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_select_panel.visible = false
+	_select_panel.gui_input.connect(func(ev: InputEvent) -> void:
+		if ev is InputEventMouseButton and ev.pressed:
+			_select_panel.visible = false)
+	ui.add_child(_select_panel)
+
+	var cc := CenterContainer.new()
+	cc.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	cc.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_select_panel.add_child(cc)
+
+	var box := PanelContainer.new()
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(1, 1, 1, 0.97)
+	style.set_corner_radius_all(24)
+	style.set_content_margin_all(30.0)
+	box.add_theme_stylebox_override("panel", style)
+	cc.add_child(box)
+
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 18)
+	box.add_child(v)
+
+	var head := Label.new()
+	head.text = "选择关卡（已解锁 %d / %d）" % [
+		mini(unlocked + 1, levels.size()), levels.size()]
+	_style_label(head, 40, Color(0.24, 0.16, 0.1))
+	head.add_theme_constant_override("outline_size", 0)
+	v.add_child(head)
+
+	var scroll := ScrollContainer.new()
+	scroll.custom_minimum_size = Vector2(910, 780)
+	v.add_child(scroll)
+
+	var grid := GridContainer.new()
+	grid.columns = 10
+	grid.add_theme_constant_override("h_separation", 8)
+	grid.add_theme_constant_override("v_separation", 8)
+	scroll.add_child(grid)
+
+	for i in levels.size():
+		var b := Button.new()
+		b.text = str(i + 1)
+		b.custom_minimum_size = Vector2(82, 70)
+		b.add_theme_font_override("font", _ui_font)
+		b.add_theme_font_size_override("font_size", 26)
+		if i > unlocked:
+			b.disabled = true
+			b.text = "🔒"
+		elif i == level_index:
+			b.add_theme_color_override("font_color", Color("#d9781f"))
+			b.add_theme_font_size_override("font_size", 30)
+		b.pressed.connect(_goto_level.bind(i))
+		grid.add_child(b)
+
+	var close := Button.new()
+	close.text = "关闭"
+	close.custom_minimum_size = Vector2(200, 64)
+	close.add_theme_font_override("font", _ui_font)
+	close.add_theme_font_size_override("font_size", 30)
+	close.pressed.connect(func() -> void: _select_panel.visible = false)
+	var hb := HBoxContainer.new()
+	hb.alignment = BoxContainer.ALIGNMENT_CENTER
+	hb.add_child(close)
+	v.add_child(hb)
+
+
+func _toggle_select() -> void:
+	_select_panel.visible = not _select_panel.visible
+
+
+func _goto_level(i: int) -> void:
+	level_index = i
+	get_tree().reload_current_scene()
 
 
 func _style_label(l: Label, size: int, color: Color) -> void:
