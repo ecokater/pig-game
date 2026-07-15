@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-小猪进圈 · 100 关生成器 v2(重视玩家体验的版本)
+小猪进圈 · 100 关生成器 v3(精确难度验证版)
 
-与 v1 的区别:
-- 通用多联骨牌构造:猪圈形状库(矩形/L/T/U/十字/阶梯/缺角),
-  随机骨牌平铺 → 每只猪选进入方向 → 车道依赖图(无环才收) → BFS 终审;
-- 人类难度模型:猪数 + 依赖链深度 + 蒙特卡洛失败率 + 余量,不再单看失败率
-  (2 只猪失败率 50% 对人类是秒懂题,10 只猪 40% 反而难);
-- 分段曲线:猪数 2→10 单调爬升,段内按失败率升序;
-- 多样性:相邻关卡不允许重复形状签名,前 8 关是各引入一个新概念的教学序列。
+与 v2 的区别:
+- 难度不再用"随机乱点失败率"抽样量化,改为对每关的完整状态空间做精确搜索:
+    p_win  —— 均匀随机玩家的精确胜率(全状态 DP);学习关要求 p_win=1,
+              即"数学上不可能失败";
+    crit   —— 关键抉择数:沿最优线有多少个决策点存在"点错就注定失败"的选项;
+    decep  —— 欺骗深度:点出致命一步后,还能走几步才暴露死局(藏得深=难);
+    paths  —— 预算内可通关的不同点击顺序总数(越少越难);
+  难度分 = 以上指标的加权组合,逐关写入报告,可复算复验。
+- 圈外允许排队:同一开口外可以排多头猪(前猪不动、后猪被堵)。
+  生成时按概率把同列/同行的骨牌对齐到同一开口,排队长度成为新的难度杠杆。
 
-用法:python3 tools/generate_levels.py   (在 tools/ 或项目根均可)
-输出:../levels.json 与 ../tools/levels_report.txt
+用法:python3 tools/generate_levels.py
+输出:../levels.json 与 levels_report.txt
 """
 import json
+import math
 import os
 import random
 from collections import deque, defaultdict
@@ -21,28 +25,29 @@ from collections import deque, defaultdict
 SEED = 20260714
 DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
-# 猪数曲线:第 i 关(0 起)的猪数;单调不减。
-# 每个猪数段是一个"世界":段内难度走一遍 易→难 的小弧线,段间整体抬升。
-# 2 猪只有 4 格形状,变化空间极小,只放 2 关避免重复感;
-# 低猪数段收短(它们撑不起长曲线),中后期段加长。
+# 猪数曲线:每个猪数是一个"世界",单调不减
 PIG_CURVE = [2] * 2 + [3] * 6 + [4] * 8 + [5] * 12 + [6] * 16 \
     + [7] * 18 + [8] * 18 + [9] * 10 + [10] * 10
 assert len(PIG_CURVE) == 100
 
-# 每个猪数段(世界)的节奏:
-# 学习期占比(失败率目标 0,练结构)→ 陷阱期(失败率从陷阱簇下沿爬到段顶)
-# 学习期不能长于池里"零风险且形状各异"的候选量,否则会被迫重复形状
-LEARN_FRAC = {2: 0.5, 3: 0.6, 4: 0.5, 5: 0.4, 6: 0.25,
+# 每个世界:学习关占比(p_win=1,先熟悉形状)与步数余量集合
+# 世界 3 是教学世界(3 猪的陷阱形状种类太少,多于 1 个陷阱关必然重复)
+LEARN_FRAC = {2: 0.5, 3: 0.84, 4: 0.5, 5: 0.4, 6: 0.25,
               7: 0.17, 8: 0.11, 9: 0.1, 10: 0.0}
-BAND_HI = {2: 0.5, 3: 0.5, 4: 0.6, 5: 0.65, 6: 0.75,
-           7: 0.85, 8: 0.9, 9: 0.95, 10: 1.0}
+WORLD_SLACKS = {2: (3,), 3: (3,), 4: (3, 2), 5: (2,),
+                6: (2, 1), 7: (1,), 8: (1,), 9: (1, 0), 10: (0,)}
 
-# 每关需要的候选数量(按猪数)
-POOL_TARGET = {2: 40, 3: 100, 4: 130, 5: 150, 6: 160,
-               7: 160, 8: 160, 9: 120, 10: 120}
+POOL_TARGET = {2: 30, 3: 160, 4: 110, 5: 100, 6: 110,
+               7: 110, 8: 110, 9: 80, 10: 80}
 
-MC_SIMS = 300          # 选关阶段的模拟局数(最终 verify 脚本会用更多局复验)
 MAX_COLS, MAX_ROWS = 10, 11
+
+# 前 8 关(全局关位)的形状教学偏好
+TUTORIAL_PREF = {
+    0: {'rect'}, 1: {'notch'}, 2: {'rect'}, 3: {'T', 'L'},
+    4: {'L', 'notch'}, 5: {'rect', 'T'}, 6: {'plus', 'U', 'T'},
+    7: {'U', 'plus', 'stairs', 'L', 'notch'},
+}
 
 
 def add(a, b):
@@ -57,51 +62,7 @@ def ekey(a, b):
     return (min(a, b), max(a, b))
 
 
-def allowed_slacks(i):
-    """步数余量:每关允许在小集合里挑,选关时用它微调难度贴合目标曲线。
-    前松后紧,最后 10 关必须最优解。"""
-    if i < 8:
-        return (3,)
-    if i < 16:
-        return (3, 2)
-    if i < 44:
-        return (2, 1)
-    if i < 80:
-        return (1,)
-    if i < 90:
-        return (1, 0)
-    return (0,)
-
-
-def make_fail_targets(pool):
-    """算出 100 关的目标失败率。
-    每段:前 LEARN_FRAC 是学习期(目标 0);之后是陷阱期,
-    目标从该段候选池里实测的陷阱簇下沿(非零失败率的 20 分位)爬到段顶。
-    候选池的失败率天然两极(无死锁≈0%,有死锁≈50%+),
-    与其硬凑不存在的中间值,不如让节奏贴合分布。"""
-    targets = [0.0] * 100
-    for n in set(PIG_CURVE):
-        slots = [j for j in range(100) if PIG_CURVE[j] == n]
-        m = len(slots)
-        fails = sorted(
-            cand['mc'][sl]
-            for cand in pool[n]
-            for j in slots for sl in allowed_slacks(j)
-            if cand['mc'][sl] > 0.15)
-        trap_lo = fails[len(fails) // 5] if fails else 0.5
-        hi = max(BAND_HI[n], trap_lo)
-        learn = round(m * LEARN_FRAC[n])
-        for k, j in enumerate(slots):
-            if k < learn:
-                targets[j] = 0.0
-            elif m - learn <= 1:
-                targets[j] = hi
-            else:
-                targets[j] = trap_lo + (hi - trap_lo) * (k - learn) / (m - learn - 1)
-    return targets
-
-
-# ── 求解与模拟(规则与游戏内 GDScript 完全一致)─────────────────────────────
+# ── 规则内核(与游戏内 GDScript 完全一致)────────────────────────────────────
 
 def build_walls(pen_set, openings):
     open_edges = set()
@@ -148,6 +109,7 @@ def _try_slide(pen_set, walls, dirs, state, i):
 
 
 def solve(pen_set, walls, pigs_list, max_depth=50):
+    """BFS 最短解;返回 (最优步数, 路径) 或 (None, None)。"""
     dirs = [p[2] for p in pigs_list]
     init = tuple((p[0], p[1]) for p in pigs_list)
 
@@ -176,33 +138,114 @@ def solve(pen_set, walls, pigs_list, max_depth=50):
     return None, None
 
 
-def monte_carlo(pen_set, walls, pigs_list, budget, n_sims, rng):
+# ── 精确难度分析(全状态空间,无抽样)─────────────────────────────────────────
+
+def analyze(pen_set, walls, pigs_list, budget):
+    """返回 {p_win, n_paths, crit, decep}:
+    p_win   均匀随机点击的精确胜率(状态×剩余步数 全记忆化);
+    n_paths 预算内可通关的点击序列总数;
+    crit    沿最优线的关键抉择数(存在致命选项的决策点个数);
+    decep   最大欺骗深度(致命一步之后还能走多少步才无路可走)。"""
     dirs = [p[2] for p in pigs_list]
-    n = len(pigs_list)
     init = tuple((p[0], p[1]) for p in pigs_list)
+    pen_has = pen_set.__contains__
 
-    def won(state):
-        return all(t in pen_set and h in pen_set for t, h in state)
+    moves_memo = {}
 
-    failures = 0
-    for _ in range(n_sims):
-        state = init
-        steps = 0
-        while steps < budget:
-            moves = []
-            for i in range(n):
+    def moves(state):
+        r = moves_memo.get(state)
+        if r is None:
+            r = []
+            for i in range(len(dirs)):
                 ns = _try_slide(pen_set, walls, dirs, state, i)
                 if ns is not None:
-                    moves.append(ns)
-            if not moves:
-                break
-            state = rng.choice(moves)
-            steps += 1
-            if won(state):
-                break
-        if not won(state):
-            failures += 1
-    return failures / n_sims
+                    r.append(ns)
+            moves_memo[state] = r
+        return r
+
+    won_memo = {}
+
+    def won(state):
+        r = won_memo.get(state)
+        if r is None:
+            r = all(pen_has(t) and pen_has(h) for t, h in state)
+            won_memo[state] = r
+        return r
+
+    dp_memo = {}
+
+    def dp(state, r):
+        key = (state, r)
+        res = dp_memo.get(key)
+        if res is not None:
+            return res
+        if won(state):
+            res = (1.0, 1)
+        elif r == 0:
+            res = (0.0, 0)
+        else:
+            ms = moves(state)
+            if not ms:
+                res = (0.0, 0)
+            else:
+                p = 0.0
+                np_ = 0
+                for ns in ms:
+                    sp, sn = dp(ns, r - 1)
+                    p += sp
+                    np_ += sn
+                res = (p / len(ms), np_)
+        dp_memo[key] = res
+        return res
+
+    play_memo = {}
+
+    def maxplay(state, r):
+        key = (state, r)
+        res = play_memo.get(key)
+        if res is not None:
+            return res
+        if won(state) or r == 0:
+            res = 0
+        else:
+            ms = moves(state)
+            res = 0 if not ms else 1 + max(maxplay(ns, r - 1) for ns in ms)
+        play_memo[key] = res
+        return res
+
+    p_win, n_paths = dp(init, budget)
+    if p_win <= 0.0:
+        return None
+
+    crit = 0
+    decep = 0
+    state, r = init, budget
+    while not won(state):
+        ms = moves(state)
+        good, fatal = [], []
+        for ns in ms:
+            (good if dp(ns, r - 1)[0] > 0.0 else fatal).append(ns)
+        if fatal:
+            crit += 1
+            decep = max(decep, max(maxplay(ns, r - 1) for ns in fatal))
+        state = max(good, key=lambda ns: dp(ns, r - 1)[0])
+        r -= 1
+    return {'p_win': p_win, 'n_paths': n_paths, 'crit': crit, 'decep': decep}
+
+
+def difficulty(cand, sl):
+    """人类体感难度分:猪数规模 + 依赖链 + 失败风险 + 抉择密度 + 死局隐蔽度
+    + 解的稀缺度 + 排队长度。权重见下,报告逐关可复验。"""
+    a = cand['an'][sl]
+    u = math.log10(1 + a['n_paths'])
+    return round(
+        1.4 * cand['n_pigs']
+        + 0.5 * cand['chain']
+        + 3.0 * (1.0 - a['p_win'])
+        + 0.5 * a['crit']
+        + 0.25 * a['decep']
+        + max(0.0, 2.5 - u)
+        + 0.4 * (cand['max_queue'] - 1), 2)
 
 
 def bbox_of(pen_set, pigs_list):
@@ -219,7 +262,6 @@ def rect(w, h, x0=0, y0=0):
 
 
 def gen_shape(rng, target_cells):
-    """随机生成一个 target_cells 格的猪圈形状,返回 (类名, 格子集合) 或 None。"""
     cls = rng.choice(['rect', 'rect', 'L', 'T', 'U', 'plus', 'stairs', 'notch'])
     cells = None
     if cls == 'rect':
@@ -230,7 +272,6 @@ def gen_shape(rng, target_cells):
         w, h = rng.choice(opts)
         cells = rect(w, h)
     elif cls == 'notch':
-        # 矩形咬掉一个 2 格角
         opts = [(w, (target_cells + 2) // w) for w in range(3, 7)
                 if (target_cells + 2) % w == 0 and 2 <= (target_cells + 2) // w <= 6]
         if not opts:
@@ -247,12 +288,11 @@ def gen_shape(rng, target_cells):
             by = cy if cy == 0 else cy - 1
             bite = {(cx, by), (cx, by + 1)}
         cells -= bite
-        # 咬掉整条边会退化成小矩形,必须仍占满原包围盒
         if cells:
             xs = [c[0] for c in cells]
             ys = [c[1] for c in cells]
             if max(xs) - min(xs) + 1 != w or max(ys) - min(ys) + 1 != h:
-                return None
+                return None   # 咬掉整条边退化成矩形
     elif cls == 'L':
         for _ in range(20):
             w, h = rng.randint(2, 5), rng.randint(2, 4)
@@ -324,7 +364,6 @@ def gen_shape(rng, target_cells):
 # ── 骨牌平铺与依赖构造 ─────────────────────────────────────────────────────────
 
 def random_tiling(cells, rng):
-    """随机完美骨牌平铺(带回溯);返回 [(a,b),...] 或 None。"""
     def bt(uncov):
         if not uncov:
             return []
@@ -341,7 +380,6 @@ def random_tiling(cells, rng):
 
 
 def topo_depth(n, edges):
-    """Kahn 拓扑排序;返回依赖链深度(最长路节点数),有环返回 None。"""
     indeg = [0] * n
     for u in edges:
         for v in edges[u]:
@@ -363,21 +401,30 @@ def topo_depth(n, edges):
 
 
 def construct(pen_set, tiling, rng, dir_tries=40):
-    """给平铺里的每只骨牌选进入方向,建停靠/借道依赖图,无环则返回
-    (pig_specs, chain_depth);pig_specs 供 finalize 使用。"""
+    """给每只骨牌选进入方向,建停靠/借道依赖图,无环则返回 (pig_specs, chain)。
+    约一半尝试用"对齐模式":同列(行)的同轴骨牌共用一个方向 → 共用开口、
+    圈外排队,排队长度成为难度杠杆。"""
     cover = {}
     for i, (a, b) in enumerate(tiling):
         cover[a] = i
         cover[b] = i
     n = len(tiling)
 
-    for _ in range(dir_tries):
+    for attempt in range(dir_tries):
+        aligned = rng.random() < 0.5
+        col_dir, row_dir = {}, {}
         specs = []
         for (a, b) in tiling:
             if a[0] == b[0]:
-                d = rng.choice([(0, 1), (0, -1)])
+                if aligned:
+                    d = col_dir.setdefault(a[0], rng.choice([(0, 1), (0, -1)]))
+                else:
+                    d = rng.choice([(0, 1), (0, -1)])
             else:
-                d = rng.choice([(1, 0), (-1, 0)])
+                if aligned:
+                    d = row_dir.setdefault(a[1], rng.choice([(1, 0), (-1, 0)]))
+                else:
+                    d = rng.choice([(1, 0), (-1, 0)])
             head = max((a, b), key=lambda c: c[0] * d[0] + c[1] * d[1])
             tail = a if head == b else b
             lane = []
@@ -418,7 +465,7 @@ def construct(pen_set, tiling, rng, dir_tries=40):
 
 # ── 等候位与关卡定型 ──────────────────────────────────────────────────────────
 
-def place_waiting(pig_specs, pen_set, rng):
+def place_waiting(pig_specs, pen_set):
     lane_map = {}
     for i, (oc, od, ed, ft, fh) in enumerate(pig_specs):
         lane_map.setdefault((oc, od), []).append(i)
@@ -441,12 +488,13 @@ def place_waiting(pig_specs, pen_set, rng):
                     placed = True
                     break
             if not placed:
-                return None
+                return None, 0
+    max_queue = max(len(g) for g in lane_map.values())
     return [(pig_positions[i][0], pig_positions[i][1], pig_specs[i][2])
-            for i in range(len(pig_specs))]
+            for i in range(len(pig_specs))], max_queue
 
 
-def finalize(pen_set, pig_specs, rng):
+def finalize(pen_set, pig_specs, n_pigs_target):
     seen_open = set()
     openings = []
     for oc, od, ed, ft, fh in pig_specs:
@@ -461,7 +509,7 @@ def finalize(pen_set, pig_specs, rng):
         used.add(ft)
         used.add(fh)
 
-    wait_pigs = place_waiting(pig_specs, pen_set, rng)
+    wait_pigs, max_queue = place_waiting(pig_specs, pen_set)
     if wait_pigs is None:
         return None
     for t, h, d in wait_pigs:
@@ -482,22 +530,22 @@ def finalize(pen_set, pig_specs, rng):
         return None
     return {
         'pen_set': pen_set, 'openings': openings, 'pigs': wait_pigs,
-        'walls': walls, 'min_steps': min_steps, 'n_pigs': len(pig_specs),
-        'cols': cols, 'rows': rows,
+        'walls': walls, 'min_steps': min_steps, 'n_pigs': n_pigs_target,
+        'cols': cols, 'rows': rows, 'max_queue': max_queue,
     }
 
 
 # ── 候选生成 ──────────────────────────────────────────────────────────────────
 
 def generate_pool(rng):
-    pool = defaultdict(list)   # n_pigs -> [candidate]
+    pool = defaultdict(list)
     attempts = 0
     max_attempts = 250000
     while attempts < max_attempts:
         attempts += 1
-        if all(len(pool[n]) >= POOL_TARGET[n] for n in POOL_TARGET):
-            break
         need = [n for n in POOL_TARGET if len(pool[n]) < POOL_TARGET[n]]
+        if not need:
+            break
         n = rng.choice(need)
         shaped = gen_shape(rng, n * 2)
         if shaped is None:
@@ -510,113 +558,169 @@ def generate_pool(rng):
         if built is None:
             continue
         pig_specs, chain = built
-        cand = finalize(set(cells), pig_specs, rng)
+        cand = finalize(set(cells), pig_specs, n)
         if cand is None:
             continue
         cand['cls'] = cls
         cand['chain'] = chain
-        # 预算 0~3 各余量下的失败率,供选关时微调难度
-        cand['mc'] = {}
-        for sl in range(4):
-            budget = cand['min_steps'] + sl
-            cand['mc'][sl] = monte_carlo(
-                cand['pen_set'], cand['walls'], cand['pigs'],
-                budget, MC_SIMS, rng)
+        # 精确难度分析(只算该世界会用到的余量)
+        cand['an'] = {}
+        bad = False
+        for sl in WORLD_SLACKS[n]:
+            a = analyze(cand['pen_set'], cand['walls'], cand['pigs'],
+                        cand['min_steps'] + sl)
+            if a is None:
+                bad = True
+                break
+            cand['an'][sl] = a
+        if bad:
+            continue
         pool[n].append(cand)
+        done = sum(len(pool[k]) for k in pool)
+        if done % 100 == 0:
+            print(f"  …候选 {done}(尝试 {attempts})")
     return pool, attempts
 
 
-# ── 选关:难度曲线 + 多样性 + 教学序列 ────────────────────────────────────────
-
-# 前 8 关的形状偏好:每关引入一个新概念
-# 0 认识点猪进圈;1 缺角圈初见"先后顺序";2-3 三猪矩形/T 形;
-# 4 L 形;5 四猪依赖链;6 十字/凹形;7 综合
-TUTORIAL_PREF = {
-    0: {'rect'}, 1: {'notch'}, 2: {'rect'}, 3: {'T', 'L'},
-    4: {'L', 'notch'}, 5: {'rect', 'T'}, 6: {'plus', 'U', 'T'},
-    7: {'U', 'plus', 'stairs', 'L', 'notch'},
-}
-
-
-FAIL_CAP = 0.15   # 实选失败率最多超出目标这么多,防止难度悬崖
-
+# ── 选关:世界节奏 + 多样性 + 排队配额 ────────────────────────────────────────
 
 def pick_levels(pool, rng):
-    targets = make_fail_targets(pool)
-    chosen = []
-    used = set()
-    recent_sig = deque(maxlen=2)   # 形状签名(类名+尺寸)不许和前两关重复
-    recent_cls = deque(maxlen=3)   # 形状类名尽量和前三关不同
-    band_sigs = set()              # 同一猪数段内每种形状签名只出现一次
-    band_n = None
+    result = []          # [{cand, slack, n}]
+    recent_sig = deque(maxlen=2)
+    global_slot = 0
 
-    for i in range(100):
-        n = PIG_CURVE[i]
-        if n != band_n:
-            band_n = n
-            band_sigs = set()
-        t = targets[i]
+    for n in sorted(set(PIG_CURVE)):
+        m = PIG_CURVE.count(n)
+        learn_cnt = round(m * LEARN_FRAC[n])
+        trap_cnt = m - learn_cnt
+        slacks = WORLD_SLACKS[n]
+        used_cand = set()
+        world_sigs = set()
 
-        def search(strict):
-            best, best_key = None, None
-            for idx, cand in enumerate(pool[n]):
-                if (n, idx) in used:
-                    continue
-                cls_name = cand['cls'].split('-')[0]
-                if strict:
-                    if cand['cls'] in recent_sig or cand['cls'] in band_sigs:
-                        continue
-                    if i in TUTORIAL_PREF and cls_name not in TUTORIAL_PREF[i]:
-                        continue
-                    if 12 <= i and cand['chain'] < 2:
-                        continue
-                for sl in allowed_slacks(i):
-                    fail = cand['mc'][sl]
-                    if strict:
-                        if fail > t + FAIL_CAP:
-                            continue
-                        if i == 0 and fail > 0.05:
-                            continue   # 第 1 关必须零风险
-                    key = abs(fail - t)
-                    if not strict:
-                        if cand['cls'] in recent_sig:
-                            key += 0.5
-                        if cand['cls'] in band_sigs:
-                            key += 0.25
-                        if fail > t + FAIL_CAP:
-                            key += 0.4
-                        if 12 <= i and cand['chain'] < 2:
-                            key += 0.2
-                    if cls_name in recent_cls:
-                        key += 0.12
-                    if 30 <= i and cand['chain'] >= 3:
-                        key -= 0.03           # 中后期偏好深依赖链
-                    key -= min(cand['chain'], 6) * 0.01
-                    if best_key is None or key < best_key:
-                        best_key = key
-                        best = (idx, cand, sl)
-            return best
+        def sig_ok(cand):
+            return cand['cls'] not in recent_sig and cand['cls'] not in world_sigs
 
-        best = search(True)
-        if best is None:
-            best = search(False)
-        if best is None:
-            raise RuntimeError(f"第 {i+1} 关无候选(猪数 {n})")
-        idx, cand, sl = best
-        used.add((n, idx))
-        recent_sig.append(cand['cls'])
-        recent_cls.append(cand['cls'].split('-')[0])
-        band_sigs.add(cand['cls'])
-        chosen.append({'cand': cand, 'slack': sl, 'n': n})
+        def commit(cand, idx, sl):
+            nonlocal global_slot
+            used_cand.add(idx)
+            world_sigs.add(cand['cls'])
+            recent_sig.append(cand['cls'])
+            result.append({'cand': cand, 'slack': sl, 'n': n})
+            global_slot += 1
 
-    # 不做事后重排:目标曲线本身即段内升序,重排会破坏"防形状重复"的相邻性
-    return chosen
+        # ── 学习关:p_win=1(可证明零风险),难度低者优先,兼顾教学形状 ──
+        max_sl = max(slacks)
+        learners = [(idx, c) for idx, c in enumerate(pool[n])
+                    if c['an'][max_sl]['p_win'] >= 1.0]
+        # 配额不能超过零风险形状的种类数,否则必然重复;多出的槽位划给陷阱关
+        learn_cnt = min(learn_cnt, len({c['cls'] for _, c in learners}))
+
+        def learn_key(item):
+            idx, c = item
+            pref = TUTORIAL_PREF.get(global_slot, None)
+            cls_name = c['cls'].split('-')[0]
+            pref_pen = 0 if (pref is None or cls_name in pref) else 1
+            return (pref_pen, difficulty(c, max_sl), rng.random())
+
+        for _ in range(learn_cnt):
+            learners.sort(key=learn_key)
+            pick = next(((idx, c) for idx, c in learners
+                         if idx not in used_cand and sig_ok(c)), None)
+            if pick is None:
+                pick = next(((idx, c) for idx, c in learners
+                             if idx not in used_cand), None)
+            if pick is None:
+                break
+            commit(pick[1], pick[0], max_sl)
+
+        # ── 陷阱关:按精确难度分升序铺开,覆盖易→难的分位点 ──
+        variants = []
+        for idx, c in enumerate(pool[n]):
+            if idx in used_cand:
+                continue
+            for sl in slacks:
+                a = c['an'][sl]
+                if a['p_win'] < 1.0:
+                    variants.append((difficulty(c, sl), idx, c, sl))
+        variants.sort(key=lambda v: v[0])
+
+        need_trap = m - len([e for e in result if e['n'] == n])
+        picked_traps = []
+        trap_sigs = set()
+        if variants and need_trap > 0:
+            K = len(variants)
+            for j in range(need_trap):
+                pos = round(j * (K - 1) / max(1, need_trap - 1))
+                pick = None
+                for off in range(K):
+                    for p in (pos + off, pos - off):
+                        if 0 <= p < K:
+                            d_, idx, c, sl = variants[p]
+                            if idx not in used_cand and sig_ok(c) \
+                                    and c['cls'] not in trap_sigs:
+                                pick = (d_, idx, c, sl)
+                                break
+                    if pick:
+                        break
+                if pick is None:
+                    # 兜底一:放开"世界内不重复",仍避免与上一关相邻重复
+                    for p in range(K):
+                        d_, idx, c, sl = variants[p]
+                        if idx not in used_cand and c['cls'] not in recent_sig:
+                            pick = (d_, idx, c, sl)
+                            break
+                if pick is None:
+                    # 兜底二:只剔除已用候选
+                    for p in range(K):
+                        d_, idx, c, sl = variants[p]
+                        if idx not in used_cand:
+                            pick = (d_, idx, c, sl)
+                            break
+                if pick is None:
+                    raise RuntimeError(f"世界 {n}:陷阱关候选不足")
+                used_cand.add(pick[1])
+                trap_sigs.add(pick[2]['cls'])
+                picked_traps.append(pick)
+
+        # 排队配额:6 猪以上世界至少 2 关有排队(若候选存在)
+        if n >= 6:
+            have_q = sum(1 for d_, i_, c, s_ in picked_traps if c['max_queue'] >= 2)
+            if have_q < 2:
+                q_vars = [v for v in variants
+                          if v[2]['max_queue'] >= 2 and v[1] not in used_cand]
+                repl = [t for t in picked_traps if t[2]['max_queue'] < 2]
+                for qv in q_vars[:2 - have_q]:
+                    if not repl:
+                        break
+                    victim = min(repl, key=lambda t: abs(t[0] - qv[0]))
+                    repl.remove(victim)
+                    picked_traps.remove(victim)
+                    used_cand.discard(victim[1])
+                    used_cand.add(qv[1])
+                    picked_traps.append(qv)
+
+        # 贪心排序:难度升序,且每次优先取与前一关形状不同的候选,
+        # 兼顾"段内递增"与"相邻不重复"
+        picked_traps.sort(key=lambda t: t[0])
+        prev_cls = result[-1]['cand']['cls'] if result else None
+        remaining = picked_traps[:]
+        while remaining:
+            nxt = next((t for t in remaining if t[2]['cls'] != prev_cls),
+                       remaining[0])
+            remaining.remove(nxt)
+            prev_cls = nxt[2]['cls']
+            world_sigs.add(nxt[2]['cls'])
+            recent_sig.append(nxt[2]['cls'])
+            result.append({'cand': nxt[2], 'slack': nxt[3], 'n': n})
+            global_slot += 1
+
+    assert len(result) == 100, f"只选出 {len(result)} 关"
+    return result
 
 
 # ── 输出 ──────────────────────────────────────────────────────────────────────
 
 def normalize(cand):
-    """坐标平移到非负,方便阅读(游戏内会自动居中,不影响逻辑)。"""
     cells = list(cand['pen_set']) + [c for p in cand['pigs'] for c in (p[0], p[1])]
     mx = min(c[0] for c in cells)
     my = min(c[1] for c in cells)
@@ -631,22 +735,24 @@ def normalize(cand):
 
 def main():
     rng = random.Random(SEED)
-    print("生成候选池……")
+    print("生成候选池(含精确难度分析)……")
     pool, attempts = generate_pool(rng)
     for n in sorted(pool):
-        print(f"  {n} 猪:{len(pool[n])} 个候选")
+        nq = sum(1 for c in pool[n] if c['max_queue'] >= 2)
+        print(f"  {n} 猪:{len(pool[n])} 个候选(含排队 {nq})")
     print(f"  共尝试 {attempts} 次")
 
-    print("按难度曲线与多样性选取 100 关……")
+    print("按世界节奏选取 100 关……")
     picked = pick_levels(pool, rng)
 
     levels_json = []
-    report = ["#    pigs shape        min budget slack chain  fail   bbox",
-              "-" * 66]
+    report = ["#    pigs shape        min bud sl ch qu  p_win  crit dcp    paths  diff  bbox",
+              "-" * 78]
     for i, entry in enumerate(picked):
         cand, sl = entry['cand'], entry['slack']
         pen, openings, pigs = normalize(cand)
         budget = cand['min_steps'] + sl
+        a = cand['an'][sl]
         levels_json.append({
             'steps': budget,
             'pen': [list(c) for c in pen],
@@ -655,8 +761,10 @@ def main():
         })
         report.append(
             f"L{i+1:03d} {cand['n_pigs']:4d} {cand['cls']:<12s} "
-            f"{cand['min_steps']:3d} {budget:6d} {sl:5d} {cand['chain']:5d} "
-            f"{cand['mc'][sl]*100:5.1f}%  {cand['cols']}x{cand['rows']}")
+            f"{cand['min_steps']:3d} {budget:3d} {sl:2d} {cand['chain']:2d} "
+            f"{cand['max_queue']:2d} {a['p_win']*100:6.2f} {a['crit']:4d} "
+            f"{a['decep']:3d} {min(a['n_paths'], 99999999):8d} "
+            f"{difficulty(cand, sl):5.2f}  {cand['cols']}x{cand['rows']}")
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, 'levels.json'), 'w') as f:
@@ -664,7 +772,7 @@ def main():
     with open(os.path.join(root, 'tools', 'levels_report.txt'), 'w') as f:
         f.write("\n".join(report) + "\n")
     print("\n".join(report[:14]))
-    print(f"……(共 100 关)已写入 levels.json")
+    print("……(共 100 关)已写入 levels.json 与 tools/levels_report.txt")
 
 
 if __name__ == '__main__':
