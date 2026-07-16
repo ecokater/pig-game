@@ -5,6 +5,8 @@ var main: Node2D
 var tail: Vector2i
 var head: Vector2i
 var dir: Vector2i
+var entered := false   # 已离开等待队列(进圈或跨在开口上)
+var qi := -1           # 所属开口队列下标
 
 var _base_scale := 1.06
 var _phase := 0.0

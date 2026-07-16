@@ -1,8 +1,9 @@
 extends Node2D
-## 主场景:反向 Arrow Puzzle,共 100 关。
-## 小猪占两格、在开口外等待,点击后沿固定方向滑入猪圈,
-## 撞到栅栏或其他小猪即停下;开口只进不出。
-## 在限定步数内全部进圈则过关。
+## 主场景:反向 Arrow Puzzle,共 100 关(队列版)。
+## 每个开口外是一条 FIFO 猪队:只有队首的猪能被点击释放进圈,
+## 进圈后沿固定方向滑到底;后面的猪自动补位。
+## 屏幕上每队最多显示 2 头,其余收纳成 🐷×n 徽章(不可点击)。
+## 在限定步数内让所有小猪全部进圈则过关。
 ##
 ## Meta 层(状态在 Meta 单例):红心体力、金币、三星评级、连胜、
 ## 道具(撤销/提示/+2步)、步数耗尽续关、皮肤、每日奖励。
@@ -11,6 +12,7 @@ const VIEW := Vector2(1024.0, 1280.0)
 const PLAY_AREA := Rect2(16.0, 170.0, 992.0, 1050.0)
 const BASE_CELL := 150.0
 const PROGRESS_CFG := "user://progress.cfg"
+const VISIBLE_PIGS := 2   # 每个开口外可见的排队猪数,与生成器一致
 
 const PigScript := preload("res://scripts/pig.gd")
 const BearScript := preload("res://scripts/bear.gd")
@@ -35,11 +37,13 @@ var min_steps := 0         # 本关最优步数(星级评价用)
 var moves_made := 0
 
 var pen_cells: Array = []
-var openings: Array = []   # [圈内格子, 朝外方向]
-var pig_defs: Array = []   # [尾格, 头格, 前进方向]
+var queues: Array = []     # [{cell, dir, count}] 开口队列定义
+var openings: Array = []   # [圈内格子, 朝外方向](供绘制)
 
-var pigs: Array = []
-var occupied := {}         # Vector2i -> pig
+var pigs: Array = []       # 所有猪节点
+var queue_all: Array = []  # 每个开口的猪节点原始顺序(队首在前,不变)
+var badges: Array = []     # 每个开口的 🐷×n 徽章 Label
+var occupied := {}         # Vector2i -> pig(仅圈内猪 + 可见等待猪)
 var walls := {}            # 边键 -> true
 var wall_list: Array = []  # [圈内格子, 朝外方向],供绘制
 var cellset := {}
@@ -49,7 +53,6 @@ var animating := false
 var bear: Node2D
 
 var _undo_stack: Array = []
-var _hint_seq: Array = []  # 缓存的最优点击序列(猪下标);玩家偏离即失效
 
 var _title: Label
 var _steps_label: Label
@@ -90,28 +93,10 @@ static func _save_progress(max_unlocked: int) -> void:
 # ---------- 关卡读取 ----------
 
 static func _parse_v2i_array(arr: Array) -> Array:
-	## 把 JSON 解析出的 [[x,y], ...] 转换成 Array[Vector2i]
 	var result: Array = []
 	for item in arr:
 		result.append(Vector2i(int(item[0]), int(item[1])))
 	return result
-
-
-static func _parse_pig(raw: Array) -> Array:
-	## raw = [[tx,ty],[hx,hy],[dx,dy]]  → [Vector2i, Vector2i, Vector2i]
-	return [
-		Vector2i(int(raw[0][0]), int(raw[0][1])),
-		Vector2i(int(raw[1][0]), int(raw[1][1])),
-		Vector2i(int(raw[2][0]), int(raw[2][1])),
-	]
-
-
-static func _parse_opening(raw: Array) -> Array:
-	## raw = [[cx,cy],[dx,dy]]  → [Vector2i, Vector2i]
-	return [
-		Vector2i(int(raw[0][0]), int(raw[0][1])),
-		Vector2i(int(raw[1][0]), int(raw[1][1])),
-	]
 
 
 static func _load_levels_from_json() -> Array:
@@ -130,21 +115,18 @@ static func _load_levels_from_json() -> Array:
 	var result: Array = []
 	for lv_raw in raw:
 		var lv: Dictionary = lv_raw
-
-		var parsed_openings: Array = []
-		for o in lv["openings"]:
-			parsed_openings.append(_parse_opening(o))
-
-		var parsed_pigs: Array = []
-		for p in lv["pigs"]:
-			parsed_pigs.append(_parse_pig(p))
-
+		var parsed_queues: Array = []
+		for q in lv["queues"]:
+			parsed_queues.append({
+				"cell": Vector2i(int(q[0][0]), int(q[0][1])),
+				"dir": Vector2i(int(q[1][0]), int(q[1][1])),
+				"count": int(q[2]),
+			})
 		result.append({
 			"steps": int(lv["steps"]),
 			"min": int(lv.get("min", lv["steps"])),
 			"pen": _parse_v2i_array(lv["pen"]),
-			"openings": parsed_openings,
-			"pigs": parsed_pigs,
+			"queues": parsed_queues,
 		})
 	return result
 
@@ -155,8 +137,6 @@ func _ready() -> void:
 		push_error("levels.json 为空或解析失败,退出")
 		return
 
-	# 读取进度并跳到已解锁的最高关(仅本次运行首次进场;
-	# 之后「从头再玩」等手动切关不再被存档覆盖)
 	if not progress_applied:
 		progress_applied = true
 		level_index = _load_progress()
@@ -181,7 +161,6 @@ func _ready() -> void:
 	_spawn_bear()
 	_build_ui()
 
-	# 每日奖励(每天首次启动)
 	if Meta.daily_pending:
 		var got: int = Meta.claim_daily()
 		_toast("每日奖励:+%d🪙 · 提示×1" % got)
@@ -191,27 +170,40 @@ func _ready() -> void:
 
 # ---------- 关卡装载 ----------
 
+func _ray_cells(c: Vector2i, d: Vector2i, count: int) -> Array:
+	## 开口在圈外需要的净空格:可见槽位 + 徽章格(与生成器一致)
+	var need := 2 * mini(VISIBLE_PIGS, count)
+	if count > VISIBLE_PIGS:
+		need += 1
+	var cells: Array = []
+	for k in range(1, need + 1):
+		cells.append(c + d * k)
+	return cells
+
+
 func _load_level(lv: Dictionary) -> void:
 	pen_cells = lv["pen"]
-	openings = lv["openings"]
-	pig_defs = lv["pigs"]
+	queues = lv["queues"]
 	max_steps = lv["steps"]
 	min_steps = lv["min"]
 	steps_left = max_steps
 	moves_made = 0
+
+	openings = []
+	for q in queues:
+		openings.append([q["cell"], q["dir"]])
 
 	cellset.clear()
 	for c in pen_cells:
 		cellset[c] = true
 	_build_walls()
 
-	# 自适应格子大小并居中(包含等候中的小猪)
+	# 自适应格子大小并居中(猪圈 + 可见排队槽位 + 徽章格)
 	var minc := Vector2i(99, 99)
 	var maxc := Vector2i(-99, -99)
 	var all_cells: Array = pen_cells.duplicate()
-	for def in pig_defs:
-		all_cells.append(def[0])
-		all_cells.append(def[1])
+	for q in queues:
+		all_cells.append_array(_ray_cells(q["cell"], q["dir"], q["count"]))
 	for c in all_cells:
 		minc = Vector2i(mini(minc.x, c.x), mini(minc.y, c.y))
 		maxc = Vector2i(maxi(maxc.x, c.x), maxi(maxc.y, c.y))
@@ -250,21 +242,100 @@ func _build_walls() -> void:
 
 
 func _spawn_pigs() -> void:
-	for def in pig_defs:
-		var pig: Node2D = PigScript.new()
-		pig.main = self
-		pig.tail = def[0]
-		pig.head = def[1]
-		pig.dir = def[2]
-		var spr := Sprite2D.new()
-		spr.name = "Sprite"
-		spr.texture = PIG_TEX
-		spr.modulate = Meta.skin_tint()
-		pig.add_child(spr)
-		add_child(pig)
-		pigs.append(pig)
-		occupied[pig.tail] = pig
-		occupied[pig.head] = pig
+	for qi in queues.size():
+		var q: Dictionary = queues[qi]
+		var c: Vector2i = q["cell"]
+		var d: Vector2i = q["dir"]
+		var lane: Array = []
+		for k in q["count"]:
+			var pig: Node2D = PigScript.new()
+			pig.main = self
+			pig.head = c + d * (1 + 2 * k)
+			pig.tail = c + d * (2 + 2 * k)
+			pig.dir = -d
+			pig.entered = false
+			pig.qi = qi
+			var spr := Sprite2D.new()
+			spr.name = "Sprite"
+			spr.texture = PIG_TEX
+			spr.modulate = Meta.skin_tint()
+			pig.add_child(spr)
+			pig.visible = k < VISIBLE_PIGS
+			add_child(pig)
+			pigs.append(pig)
+			lane.append(pig)
+		queue_all.append(lane)
+
+		# 🐷×n 徽章(收纳看不见的排队猪)
+		var badge := Label.new()
+		badge.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		badge.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		badge.add_theme_font_override("font", _ui_font)
+		badge.add_theme_font_size_override("font_size", int(cell_size * 0.42))
+		badge.add_theme_color_override("font_color", Color(0.32, 0.18, 0.08))
+		badge.add_theme_color_override("font_outline_color", Color(1, 1, 1, 0.9))
+		badge.add_theme_constant_override("outline_size", int(cell_size * 0.08))
+		badge.size = Vector2(cell_size * 2.0, cell_size)
+		var bc: Vector2i = c + d * (2 * VISIBLE_PIGS + 1)
+		badge.position = cell_center(bc) - badge.size / 2.0
+		add_child(badge)
+		badges.append(badge)
+
+	_rebuild_occupied()
+	_update_badges()
+
+
+func _waiting_list(qi: int) -> Array:
+	## 某开口仍在排队的猪(队首在前);进圈的总是队首,剩下的是原顺序后缀
+	var out: Array = []
+	for pig in queue_all[qi]:
+		if not pig.entered:
+			out.append(pig)
+	return out
+
+
+func _rebuild_occupied() -> void:
+	occupied.clear()
+	for pig in pigs:
+		if pig.entered or pig.visible:
+			occupied[pig.tail] = pig
+			occupied[pig.head] = pig
+
+
+func _relayout_queues(animate: bool) -> void:
+	## 队列补位:进圈猪让出位置后,等待猪贴着开口重排;
+	## 跨在开口上的猪(尾巴占住第一格)会把整队向外顶一格。
+	for qi in queues.size():
+		var q: Dictionary = queues[qi]
+		var c: Vector2i = q["cell"]
+		var d: Vector2i = q["dir"]
+		var base := 1
+		var first := c + d
+		if occupied.has(first) and occupied[first].entered:
+			base = 2
+		var waiting := _waiting_list(qi)
+		for k in waiting.size():
+			var pig: Node2D = waiting[k]
+			pig.head = c + d * (base + 2 * k)
+			pig.tail = c + d * (base + 2 * k + 1)
+			var was_hidden: bool = not pig.visible
+			pig.visible = k < VISIBLE_PIGS
+			if pig.visible and not was_hidden and animate:
+				var tw := create_tween()
+				tw.tween_property(pig, "position", pig.center_pos(), 0.15)\
+					.set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+			else:
+				pig.position = pig.center_pos()
+	_rebuild_occupied()
+	_update_badges()
+
+
+func _update_badges() -> void:
+	for qi in queues.size():
+		var hidden := _waiting_list(qi).size() - VISIBLE_PIGS
+		badges[qi].visible = hidden > 0
+		if hidden > 0:
+			badges[qi].text = "🐷×%d" % hidden
 
 
 func _spawn_bear() -> void:
@@ -274,13 +345,12 @@ func _spawn_bear() -> void:
 	spr.texture = BEAR_TEX
 	spr.scale = Vector2(0.8, 0.8)
 	bear.add_child(spr)
-	# 挑一个不压到小猪和猪圈的角落游荡
 	var corners := [Vector2(904, 1130), Vector2(120, 1130), Vector2(904, 280), Vector2(120, 280)]
 	var pos: Vector2 = corners[0]
 	for cand in corners:
 		var clear := true
 		for pig in pigs:
-			if pig.hit_rect().grow(70.0).has_point(cand):
+			if pig.visible and pig.hit_rect().grow(70.0).has_point(cand):
 				clear = false
 				break
 		if clear and not _pen_rect().grow(70.0).has_point(cand):
@@ -322,7 +392,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			and event.button_index == MOUSE_BUTTON_LEFT:
 		var p := get_global_mouse_position()
 		for pig in pigs:
-			if pig.hit_rect().has_point(p):
+			if pig.visible and pig.hit_rect().has_point(p):
 				_tap_pig(pig)
 				return
 
@@ -331,7 +401,7 @@ func _tap_pig(pig: Node2D) -> void:
 	# 移动前快照,供撤销道具回滚
 	var snap := {"steps": steps_left, "moves": moves_made, "pigs": []}
 	for pg in pigs:
-		snap["pigs"].append([pg, pg.tail, pg.head])
+		snap["pigs"].append([pg, pg.tail, pg.head, pg.entered])
 
 	var moved := 0
 	while moved < 64:
@@ -353,13 +423,8 @@ func _tap_pig(pig: Node2D) -> void:
 		return
 
 	_undo_stack.append(snap)
-	# 提示缓存:按提示点了就前进一步,偏离则作废
-	var idx := pigs.find(pig)
-	if not _hint_seq.is_empty():
-		if int(_hint_seq[0]) == idx:
-			_hint_seq.pop_front()
-		else:
-			_hint_seq.clear()
+	if not pig.entered:
+		pig.entered = true   # 队首进圈(或跨在开口上),离开等待队列
 
 	steps_left -= 1
 	moves_made += 1
@@ -367,6 +432,7 @@ func _tap_pig(pig: Node2D) -> void:
 	animating = true
 	await pig.slide_to_cells(0.12 + 0.05 * moved)
 	animating = false
+	_relayout_queues(true)
 	_check_state()
 
 
@@ -378,7 +444,10 @@ func _all_inside() -> bool:
 
 
 func _any_move_possible() -> bool:
+	## 只考察可见的猪(被 🐷×n 收纳的猪本来就点不到)
 	for pig in pigs:
+		if not pig.visible:
+			continue
 		var next: Vector2i = pig.head + pig.dir
 		if is_inside(pig.head) and not is_inside(next):
 			continue
@@ -405,17 +474,18 @@ func _do_undo() -> void:
 		_toast("金币不足")
 		return
 	var snap: Dictionary = _undo_stack.pop_back()
-	occupied.clear()
 	for e in snap["pigs"]:
 		var pg: Node2D = e[0]
 		pg.tail = e[1]
 		pg.head = e[2]
-		occupied[pg.tail] = pg
-		occupied[pg.head] = pg
-		pg.position = pg.center_pos()
+		pg.entered = e[3]
 	steps_left = snap["steps"]
 	moves_made = snap["moves"]
-	_hint_seq.clear()
+	_rebuild_occupied()
+	_relayout_queues(false)
+	for pg in pigs:
+		if pg.entered:
+			pg.position = pg.center_pos()
 	_update_steps_label()
 	_refresh_topbar()
 	_refresh_boosters()
@@ -424,16 +494,23 @@ func _do_undo() -> void:
 func _do_hint() -> void:
 	if game_over or animating:
 		return
-	if _hint_seq.is_empty():
-		var seq = _solve_from_current()
-		if seq == null or (seq as Array).is_empty():
-			_toast("当前局面在剩余步数内已无解,试试撤销")
-			return
-		_hint_seq = seq
+	var seq = _solve_from_current()
+	if seq == null or (seq as Array).is_empty():
+		_toast("当前局面在剩余步数内已无解,试试撤销")
+		return
 	if not Meta.use_booster("hint"):
 		_toast("金币不足")
 		return
-	pigs[int(_hint_seq[0])].flash()
+	var mv: Array = seq[0]
+	if mv[0] == "q":
+		var waiting := _waiting_list(int(mv[1]))
+		if not waiting.is_empty():
+			waiting[0].flash()
+	else:
+		for pig in pigs:
+			if pig.entered and pig.tail == mv[1] and pig.head == mv[2]:
+				pig.flash()
+				break
 	_refresh_topbar()
 	_refresh_boosters()
 
@@ -451,72 +528,114 @@ func _do_extra_steps() -> void:
 
 
 # ---------- 实时求解(提示道具用) ----------
-## 与关卡生成器同一套规则的 DFS:从当前局面找一条剩余步数内的通关序列。
-## 记忆化按「局面 + 剩余步数下界」剪枝,找到第一条解即返回。
+## 队列模型 DFS:状态 = (已入场猪 (tail,head,dir), 各队列剩余数)。
+## 移动 = 释放某队队首 / 已入场猪再滑。找到第一条通关序列即返回。
 
 func _solve_from_current() -> Variant:
-	var st: Array = []
-	var occ := {}
+	var entered: Array = []
+	var counts: Array = []
 	for pig in pigs:
-		st.append([pig.tail, pig.head])
-		occ[pig.tail] = true
-		occ[pig.head] = true
+		if pig.entered:
+			entered.append([pig.tail, pig.head, pig.dir])
+	for qi in queues.size():
+		counts.append(_waiting_list(qi).size())
+	entered.sort()
 	var visited := {}
-	return _dfs(st, occ, steps_left, visited)
+	return _dfs(entered, counts, steps_left, visited)
 
 
-func _dfs(st: Array, occ: Dictionary, remaining: int, visited: Dictionary) -> Variant:
+func _sim_slide(t: Vector2i, h: Vector2i, m: Vector2i, occ: Dictionary) -> Array:
+	var moved := 0
+	while moved < 64:
+		var next: Vector2i = h + m
+		if is_inside(h) and not is_inside(next):
+			break
+		if walls.has(_edge_key(h, next)):
+			break
+		if occ.has(next):
+			break
+		t = h
+		h = next
+		moved += 1
+	return [moved, t, h]
+
+
+func _dfs(entered: Array, counts: Array, remaining: int, visited: Dictionary) -> Variant:
 	var done := true
-	for p in st:
+	for p in entered:
 		if not (is_inside(p[0]) and is_inside(p[1])):
 			done = false
 			break
 	if done:
+		for c in counts:
+			if c > 0:
+				done = false
+				break
+	if done:
 		return []
 	if remaining <= 0:
 		return null
-	var key := _state_key(st)
+	var key := _state_key(entered, counts)
 	if int(visited.get(key, -1)) >= remaining:
 		return null
 	visited[key] = remaining
 
-	for i in st.size():
-		var nst: Array = st.duplicate(true)
-		var nocc: Dictionary = occ.duplicate()
-		if _sim_slide(nst, nocc, i) == 0:
+	var occ := {}
+	for p in entered:
+		occ[p[0]] = true
+		occ[p[1]] = true
+
+	# 释放某队队首
+	for qi in counts.size():
+		if counts[qi] == 0:
 			continue
-		var sub = _dfs(nst, nocc, remaining - 1, visited)
+		var c: Vector2i = queues[qi]["cell"]
+		var d: Vector2i = queues[qi]["dir"]
+		var h0: Vector2i = c + d
+		var t0: Vector2i = c + d * 2
+		if occ.has(h0) or occ.has(t0):
+			continue
+		var r := _sim_slide(t0, h0, -d, occ)
+		if r[0] == 0:
+			continue
+		var ne := entered.duplicate(true)
+		ne.append([r[1], r[2], -d])
+		ne.sort()
+		var nc := counts.duplicate()
+		nc[qi] -= 1
+		var sub = _dfs(ne, nc, remaining - 1, visited)
 		if sub != null:
 			var path: Array = sub
-			path.insert(0, i)
+			path.insert(0, ["q", qi])
+			return path
+
+	# 已入场猪再滑
+	for i in entered.size():
+		var p: Array = entered[i]
+		var occ2 := occ.duplicate()
+		occ2.erase(p[0])
+		occ2.erase(p[1])
+		var r := _sim_slide(p[0], p[1], p[2], occ2)
+		if r[0] == 0:
+			continue
+		var ne := entered.duplicate(true)
+		ne[i] = [r[1], r[2], p[2]]
+		ne.sort()
+		var sub = _dfs(ne, counts, remaining - 1, visited)
+		if sub != null:
+			var path: Array = sub
+			path.insert(0, ["p", p[0], p[1]])
 			return path
 	return null
 
 
-func _sim_slide(st: Array, occ: Dictionary, i: int) -> int:
-	var dir: Vector2i = pigs[i].dir
-	var moved := 0
-	while moved < 64:
-		var head: Vector2i = st[i][1]
-		var next: Vector2i = head + dir
-		if is_inside(head) and not is_inside(next):
-			break
-		if walls.has(_edge_key(head, next)):
-			break
-		if occ.has(next):
-			break
-		occ.erase(st[i][0])
-		st[i][0] = head
-		st[i][1] = next
-		occ[next] = true
-		moved += 1
-	return moved
-
-
-func _state_key(st: Array) -> String:
+func _state_key(entered: Array, counts: Array) -> String:
 	var s := ""
-	for p in st:
+	for p in entered:
 		s += "%d,%d,%d,%d;" % [p[0].x, p[0].y, p[1].x, p[1].y]
+	s += "|"
+	for c in counts:
+		s += "%d," % c
 	return s
 
 
@@ -538,7 +657,6 @@ func _win() -> void:
 		star_cnt = 2
 	var reward: Dictionary = Meta.record_win(level_index, star_cnt)
 
-	# 保存进度
 	var next_idx := level_index + 1
 	var saved := _load_progress()
 	if next_idx > saved:
@@ -586,7 +704,7 @@ func _do_fail() -> void:
 	_title.text = "糟糕…"
 	var victim: Node2D = null
 	for pig in pigs:
-		if not (is_inside(pig.tail) and is_inside(pig.head)):
+		if pig.visible and not (is_inside(pig.tail) and is_inside(pig.head)):
 			victim = pig
 			break
 	if victim != null and bear != null:
@@ -620,7 +738,6 @@ func _on_btn_pressed() -> void:
 			if Meta.try_spend(Meta.CONTINUE_PRICE):
 				game_over = false
 				steps_left += 2
-				_hint_seq.clear()
 				_panel.visible = false
 				_update_steps_label()
 				_refresh_topbar()
@@ -723,7 +840,7 @@ func _build_ui() -> void:
 	_update_steps_label()
 
 	var hint := Label.new()
-	hint.text = "点击小猪让它冲进猪圈 · 顺序很重要！"
+	hint.text = "点击队首的小猪送它进圈 · 顺序很重要！"
 	_style_label(hint, 26, Color(1, 1, 1, 0.9))
 	hint.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
 	hint.offset_top = -50.0
@@ -761,7 +878,6 @@ func _build_ui() -> void:
 	_streak_label.offset_bottom = 120.0
 	ui.add_child(_streak_label)
 
-	# 红心计时每秒刷新
 	var timer := Timer.new()
 	timer.wait_time = 1.0
 	timer.autostart = true

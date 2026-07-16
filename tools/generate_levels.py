@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-小猪进圈 · 100 关生成器 v3(精确难度验证版)
+小猪进圈 · 100 关生成器 v4(队列模型 + 8×10 猪圈 + D4 全变换去重)
 
-与 v2 的区别:
-- 难度不再用"随机乱点失败率"抽样量化,改为对每关的完整状态空间做精确搜索:
-    p_win  —— 均匀随机玩家的精确胜率(全状态 DP);学习关要求 p_win=1,
-              即"数学上不可能失败";
-    crit   —— 关键抉择数:沿最优线有多少个决策点存在"点错就注定失败"的选项;
-    decep  —— 欺骗深度:点出致命一步后,还能走几步才暴露死局(藏得深=难);
-    paths  —— 预算内可通关的不同点击顺序总数(越少越难);
-  难度分 = 以上指标的加权组合,逐关写入报告,可复算复验。
-- 圈外允许排队:同一开口外可以排多头猪(前猪不动、后猪被堵)。
-  生成时按概率把同列/同行的骨牌对齐到同一开口,排队长度成为新的难度杠杆。
+与 v3 的区别:
+- 队列模型:每个开口是一条 FIFO 猪队(数量不限)。只有队首的猪可以被点击
+  释放进圈;其余的猪自动排队补位,不占棋盘格。游戏里排不下的用 🐷×n 徽章
+  收纳显示。被收纳(未现身)的猪不可点击 —— 分析模型与游戏行为完全一致。
+- 猪圈本体 bbox ≤ 8 宽 × 10 高(竖屏),圈外只需要给可见槽位留出直线净空。
+- 去重:每关按 D4 群(旋转 90/180/270 + 四种镜像)取规范签名,100 关两两
+  不同;另要求"玩法特征"(形状类 + 猪数 + 开口数 + 队列构成)全局唯一,
+  保证每一关玩起来都有差异。
+- 难度依旧全部来自精确状态空间分析(p_win / crit / decep / paths),无抽样。
 
 用法:python3 tools/generate_levels.py
 输出:../levels.json 与 levels_report.txt
@@ -22,25 +21,32 @@ import os
 import random
 from collections import deque, defaultdict
 
-SEED = 20260714
+SEED = 20260716
 DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
+# 猪圈本体尺寸上限(宽 × 高)
+PEN_MAX_W, PEN_MAX_H = 8, 10
+
+# 每个开口在圈外可见的排队猪数;之后的猪收纳进 🐷×n 徽章(与游戏一致)
+VISIBLE_PIGS = 2
+
 # 猪数曲线:每个猪数是一个"世界",单调不减
-PIG_CURVE = [2] * 2 + [3] * 6 + [4] * 8 + [5] * 12 + [6] * 16 \
-    + [7] * 18 + [8] * 18 + [9] * 10 + [10] * 10
+PIG_CURVE = ([2] * 2 + [3] * 5 + [4] * 7 + [5] * 9 + [6] * 11 + [7] * 12
+             + [8] * 13 + [9] * 12 + [10] * 11 + [11] * 9 + [12] * 9)
 assert len(PIG_CURVE) == 100
 
-# 每个世界:学习关占比(p_win=1,先熟悉形状)与步数余量集合
-# 世界 3 是教学世界(3 猪的陷阱形状种类太少,多于 1 个陷阱关必然重复)
-LEARN_FRAC = {2: 0.5, 3: 0.84, 4: 0.5, 5: 0.4, 6: 0.25,
-              7: 0.17, 8: 0.11, 9: 0.1, 10: 0.0}
-WORLD_SLACKS = {2: (3,), 3: (3,), 4: (3, 2), 5: (2,),
-                6: (2, 1), 7: (1,), 8: (1,), 9: (1, 0), 10: (0,)}
+# 每个世界:学习关占比(p_win=1)与步数余量集合
+LEARN_FRAC = {2: 0.5, 3: 0.8, 4: 0.45, 5: 0.35, 6: 0.27,
+              7: 0.17, 8: 0.15, 9: 0.08, 10: 0.09, 11: 0.0, 12: 0.0}
+WORLD_SLACKS = {2: (3,), 3: (3,), 4: (3, 2), 5: (2,), 6: (2, 1),
+                7: (1,), 8: (1,), 9: (1, 0), 10: (1, 0), 11: (0,), 12: (0,)}
 
-POOL_TARGET = {2: 30, 3: 160, 4: 110, 5: 100, 6: 110,
-               7: 110, 8: 110, 9: 80, 10: 80}
+POOL_TARGET = {2: 30, 3: 110, 4: 110, 5: 100, 6: 100, 7: 100,
+               8: 100, 9: 90, 10: 90, 11: 70, 12: 70}
 
-MAX_COLS, MAX_ROWS = 10, 11
+# 状态空间保险丝:精确分析超过该状态数的候选直接弃用(保证每关都可精确验证)
+DP_STATE_CAP = 3_000_000
+BFS_NODE_CAP = 2_000_000
 
 # 前 8 关(全局关位)的形状教学偏好
 TUTORIAL_PREF = {
@@ -63,6 +69,12 @@ def ekey(a, b):
 
 
 # ── 规则内核(与游戏内 GDScript 完全一致)────────────────────────────────────
+# 关卡 = 猪圈 pen_set + 开口队列 queues=[(entry_cell, out_dir, count)]
+# 状态 = (已入场猪的 (tail, head, move_dir) 有序元组, 各队列剩余数)
+# 合法移动:
+#   1. 释放某队列的队首猪:在开口外 (c+2d, c+d) 生成、沿 -d 滑入,至少走 1 格;
+#   2. 点击已入场的猪(含跨在开口上的),沿其固定方向再滑,至少走 1 格。
+# 胜利 = 所有队列清空 且 所有已入场猪完全在圈内。
 
 def build_walls(pen_set, openings):
     open_edges = set()
@@ -80,17 +92,11 @@ def build_walls(pen_set, openings):
     return walls
 
 
-def _try_slide(pen_set, walls, dirs, state, i):
-    occ = set()
-    for j, (t, h) in enumerate(state):
-        if j != i:
-            occ.add(t)
-            occ.add(h)
-    t, h = state[i]
-    d = dirs[i]
+def _slide(pen_set, walls, occ, t, h, m):
+    """从 (t,h) 沿 m 滑到底;occ 为其他猪占格。返回 (moved, t, h)。"""
     moved = 0
-    while True:
-        nxt = add(h, d)
+    while moved < 100:
+        nxt = add(h, m)
         if h in pen_set and nxt not in pen_set:
             break
         if ekey(h, nxt) in walls:
@@ -99,68 +105,93 @@ def _try_slide(pen_set, walls, dirs, state, i):
             break
         t, h = h, nxt
         moved += 1
-        if moved >= 100:
-            return None
-    if moved == 0:
-        return None
-    s = list(state)
-    s[i] = (t, h)
-    return tuple(s)
+    return moved, t, h
 
 
-def solve(pen_set, walls, pigs_list, max_depth=50):
-    """BFS 最短解;返回 (最优步数, 路径) 或 (None, None)。"""
-    dirs = [p[2] for p in pigs_list]
-    init = tuple((p[0], p[1]) for p in pigs_list)
+def q_moves(pen_set, walls, queues, state):
+    """枚举当前状态的所有合法移动,返回 [(新状态)]。
+    state = (entered, counts):entered = ((t,h,m), ...) 排序元组。"""
+    entered, counts = state
+    occ = set()
+    for t, h, m in entered:
+        occ.add(t)
+        occ.add(h)
+    results = []
 
-    def won(state):
-        return all(t in pen_set and h in pen_set for t, h in state)
+    # 1. 释放各队列的队首猪
+    for qi, (c, d, total) in enumerate(queues):
+        if counts[qi] == 0:
+            continue
+        h0 = add(c, d)
+        t0 = add(h0, d)
+        if h0 in occ or t0 in occ:
+            continue
+        m = neg(d)
+        moved, t, h = _slide(pen_set, walls, occ, t0, h0, m)
+        if moved == 0:
+            continue
+        ne = tuple(sorted(entered + ((t, h, m),)))
+        nc = counts[:qi] + (counts[qi] - 1,) + counts[qi + 1:]
+        results.append((ne, nc))
 
-    seen = {init: (None, None)}
+    # 2. 已入场的猪再滑
+    for i, (t, h, m) in enumerate(entered):
+        occ2 = occ - {t, h}
+        moved, nt, nh = _slide(pen_set, walls, occ2, t, h, m)
+        if moved == 0:
+            continue
+        ne = tuple(sorted(entered[:i] + entered[i + 1:] + ((nt, nh, m),)))
+        results.append((ne, counts))
+    return results
+
+
+def q_won(pen_set, state):
+    entered, counts = state
+    if any(counts):
+        return False
+    return all(t in pen_set and h in pen_set for t, h, m in entered)
+
+
+def solve(pen_set, walls, queues, max_depth=60):
+    """BFS 最短解;返回 最优步数 或 None。"""
+    init = ((), tuple(q[2] for q in queues))
+    seen = {init}
     q = deque([(init, 0)])
     while q:
         state, depth = q.popleft()
-        if won(state):
-            path = []
-            s = state
-            while seen[s][0] is not None:
-                prev, i = seen[s]
-                path.append(i)
-                s = prev
-            return depth, list(reversed(path))
+        if q_won(pen_set, state):
+            return depth
         if depth >= max_depth:
             continue
-        for i in range(len(pigs_list)):
-            ns = _try_slide(pen_set, walls, dirs, state, i)
-            if ns is not None and ns not in seen:
-                seen[ns] = (state, i)
+        if len(seen) > BFS_NODE_CAP:
+            return None
+        for ns in q_moves(pen_set, walls, queues, state):
+            if ns not in seen:
+                seen.add(ns)
                 q.append((ns, depth + 1))
-    return None, None
+    return None
 
 
 # ── 精确难度分析(全状态空间,无抽样)─────────────────────────────────────────
 
-def analyze(pen_set, walls, pigs_list, budget):
-    """返回 {p_win, n_paths, crit, decep}:
-    p_win   均匀随机点击的精确胜率(状态×剩余步数 全记忆化);
-    n_paths 预算内可通关的点击序列总数;
-    crit    沿最优线的关键抉择数(存在致命选项的决策点个数);
-    decep   最大欺骗深度(致命一步之后还能走多少步才无路可走)。"""
-    dirs = [p[2] for p in pigs_list]
-    init = tuple((p[0], p[1]) for p in pigs_list)
-    pen_has = pen_set.__contains__
+class TooLarge(Exception):
+    pass
+
+
+def analyze(pen_set, walls, queues, budget):
+    """返回 {p_win, n_paths, crit, decep} 或 None(预算内不可解);
+    状态数超过 DP_STATE_CAP 抛 TooLarge。"""
+    init = ((), tuple(q[2] for q in queues))
 
     moves_memo = {}
 
     def moves(state):
         r = moves_memo.get(state)
         if r is None:
-            r = []
-            for i in range(len(dirs)):
-                ns = _try_slide(pen_set, walls, dirs, state, i)
-                if ns is not None:
-                    r.append(ns)
+            r = q_moves(pen_set, walls, queues, state)
             moves_memo[state] = r
+            if len(moves_memo) > DP_STATE_CAP:
+                raise TooLarge()
         return r
 
     won_memo = {}
@@ -168,7 +199,7 @@ def analyze(pen_set, walls, pigs_list, budget):
     def won(state):
         r = won_memo.get(state)
         if r is None:
-            r = all(pen_has(t) and pen_has(h) for t, h in state)
+            r = q_won(pen_set, state)
             won_memo[state] = r
         return r
 
@@ -234,46 +265,93 @@ def analyze(pen_set, walls, pigs_list, budget):
 
 
 def difficulty(cand, sl):
-    """人类体感难度分:猪数规模 + 依赖链 + 失败风险 + 抉择密度 + 死局隐蔽度
-    + 解的稀缺度 + 排队长度。权重见下,报告逐关可复验。"""
+    """人类体感难度分:规模 + 依赖链 + 失败风险 + 抉择密度 + 死局隐蔽度
+    + 解的稀缺度 + 排队深度。"""
     a = cand['an'][sl]
     u = math.log10(1 + a['n_paths'])
     return round(
-        1.4 * cand['n_pigs']
+        1.2 * cand['n_pigs']
         + 0.5 * cand['chain']
         + 3.0 * (1.0 - a['p_win'])
         + 0.5 * a['crit']
         + 0.25 * a['decep']
         + max(0.0, 2.5 - u)
-        + 0.4 * (cand['max_queue'] - 1), 2)
+        + 0.5 * (cand['max_queue'] - 1), 2)
 
 
-def bbox_of(pen_set, pigs_list):
-    cells = list(pen_set) + [c for p in pigs_list for c in (p[0], p[1])]
-    xs = [c[0] for c in cells]
-    ys = [c[1] for c in cells]
-    return max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+# ── D4 变换与签名 ─────────────────────────────────────────────────────────────
+
+def _xform(c, k):
+    x, y = c
+    if k == 0:
+        return (x, y)
+    if k == 1:
+        return (-y, x)      # 旋转 90°
+    if k == 2:
+        return (-x, -y)     # 旋转 180°
+    if k == 3:
+        return (y, -x)      # 旋转 270°
+    if k == 4:
+        return (-x, y)      # 水平镜像
+    if k == 5:
+        return (x, -y)      # 垂直镜像
+    if k == 6:
+        return (y, x)       # 主对角镜像
+    return (-y, -x)         # 副对角镜像
 
 
-# ── 形状库 ────────────────────────────────────────────────────────────────────
+def canon_sig(pen_set, queues):
+    """D4 八变换下的规范签名:任意两关(含彼此的旋转/镜像)都不同。"""
+    best = None
+    for k in range(8):
+        pen = [_xform(c, k) for c in pen_set]
+        qs = [(_xform(c, k), _xform(add(c, d), k), n) for c, d, n in queues]
+        mx = min(c[0] for c in pen)
+        my = min(c[1] for c in pen)
+        pen_n = tuple(sorted((x - mx, y - my) for x, y in pen))
+        qs_n = tuple(sorted(((c[0] - mx, c[1] - my),
+                             (o[0] - mx, o[1] - my), n) for c, o, n in qs))
+        sig = (pen_n, qs_n)
+        if best is None or sig < best:
+            best = sig
+    return best
+
+
+def play_sig(cand):
+    """玩法特征签名(旋转无关):形状类 + 猪数 + 开口数 + 队列构成。
+    全局唯一 → 每一关玩起来都有差异。"""
+    profile = tuple(sorted((n for _, _, n in cand['queues']), reverse=True))
+    return (cand['cls'], cand['n_pigs'], len(cand['queues']), profile)
+
+
+# ── 形状库(bbox ≤ 8 宽 × 10 高)───────────────────────────────────────────────
 
 def rect(w, h, x0=0, y0=0):
     return {(x0 + x, y0 + y) for x in range(w) for y in range(h)}
 
 
+def _dims_ok(cells):
+    xs = [c[0] for c in cells]
+    ys = [c[1] for c in cells]
+    return (max(xs) - min(xs) + 1 <= PEN_MAX_W
+            and max(ys) - min(ys) + 1 <= PEN_MAX_H)
+
+
 def gen_shape(rng, target_cells):
-    cls = rng.choice(['rect', 'rect', 'L', 'T', 'U', 'plus', 'stairs', 'notch'])
+    cls = rng.choice(['rect', 'rect', 'L', 'T', 'U', 'plus', 'stairs',
+                      'notch', 'Z', 'H'])
     cells = None
     if cls == 'rect':
-        opts = [(w, target_cells // w) for w in range(2, 7)
-                if target_cells % w == 0 and 2 <= target_cells // w <= 6]
+        opts = [(w, target_cells // w) for w in range(2, 9)
+                if target_cells % w == 0 and 2 <= target_cells // w <= 10]
         if not opts:
             return None
         w, h = rng.choice(opts)
         cells = rect(w, h)
     elif cls == 'notch':
-        opts = [(w, (target_cells + 2) // w) for w in range(3, 7)
-                if (target_cells + 2) % w == 0 and 2 <= (target_cells + 2) // w <= 6]
+        opts = [(w, (target_cells + 2) // w) for w in range(3, 9)
+                if (target_cells + 2) % w == 0
+                and 2 <= (target_cells + 2) // w <= 10]
         if not opts:
             return None
         w, h = rng.choice(opts)
@@ -295,12 +373,12 @@ def gen_shape(rng, target_cells):
                 return None   # 咬掉整条边退化成矩形
     elif cls == 'L':
         for _ in range(20):
-            w, h = rng.randint(2, 5), rng.randint(2, 4)
+            w, h = rng.randint(2, 6), rng.randint(2, 6)
             rest = target_cells - w * h
             if rest <= 0:
                 continue
             opts = [(aw, rest // aw) for aw in range(2, w + 1)
-                    if rest % aw == 0 and 1 <= rest // aw <= 3]
+                    if rest % aw == 0 and 1 <= rest // aw <= 4]
             if not opts:
                 continue
             aw, ah = rng.choice(opts)
@@ -308,21 +386,21 @@ def gen_shape(rng, target_cells):
             break
     elif cls == 'T':
         for _ in range(20):
-            bw = rng.choice([4, 5, 6])
+            bw = rng.choice([4, 5, 6, 7, 8])
             bh = rng.randint(1, 3)
             rest = target_cells - bw * bh
             if rest <= 0 or rest % 2 != 0:
                 continue
             sh = rest // 2
-            if not 1 <= sh <= 3:
+            if not 1 <= sh <= 7:
                 continue
             off = (bw - 2) // 2
             cells = rect(bw, bh) | rect(2, sh, off, bh)
             break
     elif cls == 'U':
         for _ in range(20):
-            w = rng.randint(4, 6)
-            h = rng.randint(3, 4)
+            w = rng.randint(4, 8)
+            h = rng.randint(3, 6)
             side = rng.randint(1, 2)
             nw = w - 2 * side
             if nw < 1:
@@ -342,7 +420,7 @@ def gen_shape(rng, target_cells):
                          | rect(arm, 2, c + 2, c))
                 break
     elif cls == 'stairs':
-        for steps in (2, 3):
+        for steps in (2, 3, 4):
             for sw in (3, 4):
                 if steps * sw * 2 == target_cells:
                     cells = set()
@@ -351,14 +429,39 @@ def gen_shape(rng, target_cells):
                     break
             if cells:
                 break
+    elif cls == 'Z':
+        for _ in range(20):
+            w = rng.randint(3, 6)
+            h = rng.randint(2, 4)
+            if 2 * w * h != target_cells:
+                continue
+            off = rng.randint(1, min(3, w - 1))
+            cells = rect(w, h) | rect(w, h, off, h)
+            break
+    elif cls == 'H':
+        for _ in range(20):
+            side_h = rng.randint(4, 8)
+            bar_w = rng.randint(1, 3)
+            if side_h % 2 == 0 and bar_w % 2 == 0:
+                continue
+            rest = target_cells - 4 * side_h
+            if rest != bar_w * 2:
+                continue
+            mid = (side_h - 2) // 2
+            cells = (rect(2, side_h) | rect(2, side_h, 2 + bar_w, 0)
+                     | rect(bar_w, 2, 2, mid))
+            break
     if cells is None or len(cells) != target_cells:
+        return None
+    # 随机转置增加竖 / 横形态变化(D4 去重不受影响,只是初始朝向)
+    if rng.random() < 0.5:
+        cells = {(y, x) for x, y in cells}
+    if not _dims_ok(cells):
         return None
     xs = [c[0] for c in cells]
     ys = [c[1] for c in cells]
     w, h = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
-    if w > 6 or h > 7:
-        return None
-    return f"{cls}-{w}x{h}", cells
+    return f"{cls}-{min(w, h)}x{max(w, h)}", cells
 
 
 # ── 骨牌平铺与依赖构造 ─────────────────────────────────────────────────────────
@@ -401,9 +504,9 @@ def topo_depth(n, edges):
 
 
 def construct(pen_set, tiling, rng, dir_tries=40):
-    """给每只骨牌选进入方向,建停靠/借道依赖图,无环则返回 (pig_specs, chain)。
-    约一半尝试用"对齐模式":同列(行)的同轴骨牌共用一个方向 → 共用开口、
-    圈外排队,排队长度成为难度杠杆。"""
+    """给每只骨牌选进入方向,建停靠/借道依赖图,无环则返回
+    (queues, chain, max_queue)。对齐模式(同列/行共用方向 → 同开口排队)
+    是队列玩法的主要来源,占 3/4 尝试。"""
     cover = {}
     for i, (a, b) in enumerate(tiling):
         cover[a] = i
@@ -411,7 +514,7 @@ def construct(pen_set, tiling, rng, dir_tries=40):
     n = len(tiling)
 
     for attempt in range(dir_tries):
-        aligned = rng.random() < 0.5
+        aligned = rng.random() < 0.75
         col_dir, row_dir = {}, {}
         specs = []
         for (a, b) in tiling:
@@ -457,81 +560,43 @@ def construct(pen_set, tiling, rng, dir_tries=40):
         chain = topo_depth(n, edges)
         if chain is None:
             continue
-        pig_specs = [(s['entry'], neg(s['d']), s['d'], s['tail'], s['head'])
-                     for s in specs]
-        return pig_specs, chain
+
+        # 汇成开口队列:入口格 + 朝外方向 + 数量
+        lane_map = defaultdict(int)
+        for s in specs:
+            lane_map[(s['entry'], neg(s['d']))] += 1
+        queues = [(c, d, cnt) for (c, d), cnt in sorted(lane_map.items())]
+        return queues, chain, max(lane_map.values())
     return None
 
 
-# ── 等候位与关卡定型 ──────────────────────────────────────────────────────────
-
-def place_waiting(pig_specs, pen_set):
-    lane_map = {}
-    for i, (oc, od, ed, ft, fh) in enumerate(pig_specs):
-        lane_map.setdefault((oc, od), []).append(i)
-
-    occupied = set()
-    pig_positions = {}
-    for (oc, od), group in lane_map.items():
-        slot = 1
-        for idx in group:
-            placed = False
-            for gap in range(slot, slot + 20):
-                hw = (oc[0] + od[0] * gap, oc[1] + od[1] * gap)
-                tw = add(hw, od)
-                if (hw not in occupied and tw not in occupied
-                        and hw not in pen_set and tw not in pen_set):
-                    occupied.add(hw)
-                    occupied.add(tw)
-                    pig_positions[idx] = (tw, hw)
-                    slot = gap + 1
-                    placed = True
-                    break
-            if not placed:
-                return None, 0
-    max_queue = max(len(g) for g in lane_map.values())
-    return [(pig_positions[i][0], pig_positions[i][1], pig_specs[i][2])
-            for i in range(len(pig_specs))], max_queue
+def ray_cells(c, d, count):
+    """一个开口在圈外需要的净空格:可见槽位(每头猪 2 格)+ 徽章格。"""
+    need = 2 * min(VISIBLE_PIGS, count) + (1 if count > VISIBLE_PIGS else 0)
+    return [add(c, (d[0] * k, d[1] * k)) for k in range(1, need + 1)]
 
 
-def finalize(pen_set, pig_specs, n_pigs_target):
-    seen_open = set()
-    openings = []
-    for oc, od, ed, ft, fh in pig_specs:
-        if (oc, od) not in seen_open:
-            seen_open.add((oc, od))
-            openings.append((oc, od))
-
+def finalize(pen_set, cls, queues, chain, max_queue, n_pigs):
+    # 圈外净空:可见槽位互不重叠、不压猪圈
     used = set()
-    for oc, od, ed, ft, fh in pig_specs:
-        if ft not in pen_set or fh not in pen_set or ft in used or fh in used:
-            return None
-        used.add(ft)
-        used.add(fh)
+    for c, d, cnt in queues:
+        for cell in ray_cells(c, d, cnt):
+            if cell in pen_set or cell in used:
+                return None
+            used.add(cell)
 
-    wait_pigs, max_queue = place_waiting(pig_specs, pen_set)
-    if wait_pigs is None:
-        return None
-    for t, h, d in wait_pigs:
-        if t in pen_set or h in pen_set:
-            return None
-
-    cols, rows = bbox_of(pen_set, wait_pigs)
-    if cols > MAX_COLS or rows > MAX_ROWS:
-        return None
-
-    walls = build_walls(pen_set, openings)
-    for t, h, d in wait_pigs:
-        if ekey(h, add(h, d)) in walls:
-            return None
-
-    min_steps, _ = solve(pen_set, walls, wait_pigs)
+    walls = build_walls(pen_set, [(c, d) for c, d, _ in queues])
+    min_steps = solve(pen_set, walls, queues)
     if min_steps is None:
         return None
+
+    xs = [c[0] for c in pen_set]
+    ys = [c[1] for c in pen_set]
     return {
-        'pen_set': pen_set, 'openings': openings, 'pigs': wait_pigs,
-        'walls': walls, 'min_steps': min_steps, 'n_pigs': n_pigs_target,
-        'cols': cols, 'rows': rows, 'max_queue': max_queue,
+        'pen_set': pen_set, 'queues': queues, 'walls': walls,
+        'min_steps': min_steps, 'n_pigs': n_pigs, 'cls': cls,
+        'chain': chain, 'max_queue': max_queue,
+        'pen_w': max(xs) - min(xs) + 1, 'pen_h': max(ys) - min(ys) + 1,
     }
 
 
@@ -539,8 +604,9 @@ def finalize(pen_set, pig_specs, n_pigs_target):
 
 def generate_pool(rng):
     pool = defaultdict(list)
+    canon_seen = set()
     attempts = 0
-    max_attempts = 250000
+    max_attempts = 400000
     while attempts < max_attempts:
         attempts += 1
         need = [n for n in POOL_TARGET if len(pool[n]) < POOL_TARGET[n]]
@@ -557,24 +623,32 @@ def generate_pool(rng):
         built = construct(set(cells), tiling, rng)
         if built is None:
             continue
-        pig_specs, chain = built
-        cand = finalize(set(cells), pig_specs, n)
+        queues, chain, max_queue = built
+        cand = finalize(set(cells), cls, queues, chain, max_queue, n)
         if cand is None:
             continue
-        cand['cls'] = cls
-        cand['chain'] = chain
-        # 精确难度分析(只算该世界会用到的余量)
+        # 候选池阶段就按 D4 规范签名查重,避免同构候选占位
+        sig = canon_sig(cand['pen_set'], cand['queues'])
+        if sig in canon_seen:
+            continue
+        # 精确难度分析(只算该世界会用到的余量);状态过大直接弃用
         cand['an'] = {}
         bad = False
         for sl in WORLD_SLACKS[n]:
-            a = analyze(cand['pen_set'], cand['walls'], cand['pigs'],
-                        cand['min_steps'] + sl)
+            try:
+                a = analyze(cand['pen_set'], cand['walls'], cand['queues'],
+                            cand['min_steps'] + sl)
+            except TooLarge:
+                bad = True
+                break
             if a is None:
                 bad = True
                 break
             cand['an'][sl] = a
         if bad:
             continue
+        canon_seen.add(sig)
+        cand['canon'] = sig
         pool[n].append(cand)
         done = sum(len(pool[k]) for k in pool)
         if done % 100 == 0:
@@ -582,29 +656,32 @@ def generate_pool(rng):
     return pool, attempts
 
 
-# ── 选关:世界节奏 + 多样性 + 排队配额 ────────────────────────────────────────
+# ── 选关:世界节奏 + 玩法特征唯一 + 排队配额 ───────────────────────────────────
 
 def pick_levels(pool, rng):
     result = []          # [{cand, slack, n}]
     recent_sig = deque(maxlen=2)
     global_slot = 0
+    used_play = set()    # 玩法特征全局唯一
 
     for n in sorted(set(PIG_CURVE)):
         m = PIG_CURVE.count(n)
         learn_cnt = round(m * LEARN_FRAC[n])
-        trap_cnt = m - learn_cnt
         slacks = WORLD_SLACKS[n]
         used_cand = set()
         world_sigs = set()
 
         def sig_ok(cand):
-            return cand['cls'] not in recent_sig and cand['cls'] not in world_sigs
+            return (cand['cls'] not in recent_sig
+                    and cand['cls'] not in world_sigs
+                    and play_sig(cand) not in used_play)
 
         def commit(cand, idx, sl):
             nonlocal global_slot
             used_cand.add(idx)
             world_sigs.add(cand['cls'])
             recent_sig.append(cand['cls'])
+            used_play.add(play_sig(cand))
             result.append({'cand': cand, 'slack': sl, 'n': n})
             global_slot += 1
 
@@ -612,7 +689,6 @@ def pick_levels(pool, rng):
         max_sl = max(slacks)
         learners = [(idx, c) for idx, c in enumerate(pool[n])
                     if c['an'][max_sl]['p_win'] >= 1.0]
-        # 配额不能超过零风险形状的种类数,否则必然重复;多出的槽位划给陷阱关
         learn_cnt = min(learn_cnt, len({c['cls'] for _, c in learners}))
 
         def learn_key(item):
@@ -628,7 +704,8 @@ def pick_levels(pool, rng):
                          if idx not in used_cand and sig_ok(c)), None)
             if pick is None:
                 pick = next(((idx, c) for idx, c in learners
-                             if idx not in used_cand), None)
+                             if idx not in used_cand
+                             and play_sig(c) not in used_play), None)
             if pick is None:
                 break
             commit(pick[1], pick[0], max_sl)
@@ -663,44 +740,54 @@ def pick_levels(pool, rng):
                     if pick:
                         break
                 if pick is None:
-                    # 兜底一:放开"世界内不重复",仍避免与上一关相邻重复
+                    # 兜底:放开形状类约束,但玩法特征必须仍然唯一
                     for p in range(K):
                         d_, idx, c, sl = variants[p]
-                        if idx not in used_cand and c['cls'] not in recent_sig:
+                        if idx not in used_cand \
+                                and play_sig(c) not in used_play \
+                                and c['cls'] not in recent_sig:
                             pick = (d_, idx, c, sl)
                             break
                 if pick is None:
-                    # 兜底二:只剔除已用候选
                     for p in range(K):
                         d_, idx, c, sl = variants[p]
-                        if idx not in used_cand:
+                        if idx not in used_cand \
+                                and play_sig(c) not in used_play:
                             pick = (d_, idx, c, sl)
                             break
                 if pick is None:
                     raise RuntimeError(f"世界 {n}:陷阱关候选不足")
                 used_cand.add(pick[1])
                 trap_sigs.add(pick[2]['cls'])
+                used_play.add(play_sig(pick[2]))
                 picked_traps.append(pick)
 
-        # 排队配额:6 猪以上世界至少 2 关有排队(若候选存在)
-        if n >= 6:
-            have_q = sum(1 for d_, i_, c, s_ in picked_traps if c['max_queue'] >= 2)
-            if have_q < 2:
+        # 排队配额:5 猪以上世界至少 3 关有深排队(队列 ≥3,若候选存在)
+        if n >= 5:
+            have_q = sum(1 for d_, i_, c, s_ in picked_traps
+                         if c['max_queue'] >= 3)
+            if have_q < 3:
                 q_vars = [v for v in variants
-                          if v[2]['max_queue'] >= 2 and v[1] not in used_cand]
-                repl = [t for t in picked_traps if t[2]['max_queue'] < 2]
-                for qv in q_vars[:2 - have_q]:
-                    if not repl:
+                          if v[2]['max_queue'] >= 3 and v[1] not in used_cand]
+                repl = [t for t in picked_traps if t[2]['max_queue'] < 3]
+                done_q = 0
+                for qv in q_vars:
+                    if done_q >= 3 - have_q or not repl:
                         break
+                    # 逐个重查:前一个替换可能已占用同样的玩法特征
+                    if play_sig(qv[2]) in used_play or qv[1] in used_cand:
+                        continue
+                    done_q += 1
                     victim = min(repl, key=lambda t: abs(t[0] - qv[0]))
                     repl.remove(victim)
                     picked_traps.remove(victim)
                     used_cand.discard(victim[1])
+                    used_play.discard(play_sig(victim[2]))
                     used_cand.add(qv[1])
+                    used_play.add(play_sig(qv[2]))
                     picked_traps.append(qv)
 
-        # 贪心排序:难度升序,且每次优先取与前一关形状不同的候选,
-        # 兼顾"段内递增"与"相邻不重复"
+        # 贪心排序:难度升序,且每次优先取与前一关形状不同的候选
         picked_traps.sort(key=lambda t: t[0])
         prev_cls = result[-1]['cand']['cls'] if result else None
         remaining = picked_traps[:]
@@ -721,51 +808,60 @@ def pick_levels(pool, rng):
 # ── 输出 ──────────────────────────────────────────────────────────────────────
 
 def normalize(cand):
-    cells = list(cand['pen_set']) + [c for p in cand['pigs'] for c in (p[0], p[1])]
+    """平移到原点(含圈外净空格),保证 JSON 坐标非负。"""
+    cells = list(cand['pen_set'])
+    for c, d, cnt in cand['queues']:
+        cells += ray_cells(c, d, cnt)
     mx = min(c[0] for c in cells)
     my = min(c[1] for c in cells)
 
     def sh(c):
         return (c[0] - mx, c[1] - my)
     pen = sorted(sh(c) for c in cand['pen_set'])
-    openings = [(sh(c), d) for c, d in cand['openings']]
-    pigs = [(sh(t), sh(h), d) for t, h, d in cand['pigs']]
-    return pen, openings, pigs
+    queues = [(sh(c), d, cnt) for c, d, cnt in cand['queues']]
+    return pen, queues
 
 
 def main():
     rng = random.Random(SEED)
-    print("生成候选池(含精确难度分析)……")
+    print("生成候选池(队列模型,含精确难度分析)……")
     pool, attempts = generate_pool(rng)
     for n in sorted(pool):
-        nq = sum(1 for c in pool[n] if c['max_queue'] >= 2)
-        print(f"  {n} 猪:{len(pool[n])} 个候选(含排队 {nq})")
+        nq = sum(1 for c in pool[n] if c['max_queue'] >= 3)
+        print(f"  {n} 猪:{len(pool[n])} 个候选(深排队 {nq})")
     print(f"  共尝试 {attempts} 次")
 
     print("按世界节奏选取 100 关……")
     picked = pick_levels(pool, rng)
 
+    # 全局唯一性终检
+    canons = [e['cand']['canon'] for e in picked]
+    plays = [play_sig(e['cand']) for e in picked]
+    assert len(set(canons)) == 100, "存在 D4 同构关卡!"
+    assert len(set(plays)) == 100, "存在玩法特征重复关卡!"
+
     levels_json = []
-    report = ["#    pigs shape        min bud sl ch qu  p_win  crit dcp    paths  diff  bbox",
-              "-" * 78]
+    report = ["#    pigs shape        min bud sl ch qu op  p_win  crit dcp"
+              "    paths  diff  pen",
+              "-" * 82]
     for i, entry in enumerate(picked):
         cand, sl = entry['cand'], entry['slack']
-        pen, openings, pigs = normalize(cand)
+        pen, queues = normalize(cand)
         budget = cand['min_steps'] + sl
         a = cand['an'][sl]
         levels_json.append({
             'steps': budget,
             'min': cand['min_steps'],
             'pen': [list(c) for c in pen],
-            'openings': [[list(c), list(d)] for c, d in openings],
-            'pigs': [[list(t), list(h), list(d)] for t, h, d in pigs],
+            'queues': [[list(c), list(d), cnt] for c, d, cnt in queues],
         })
         report.append(
             f"L{i+1:03d} {cand['n_pigs']:4d} {cand['cls']:<12s} "
             f"{cand['min_steps']:3d} {budget:3d} {sl:2d} {cand['chain']:2d} "
-            f"{cand['max_queue']:2d} {a['p_win']*100:6.2f} {a['crit']:4d} "
-            f"{a['decep']:3d} {min(a['n_paths'], 99999999):8d} "
-            f"{difficulty(cand, sl):5.2f}  {cand['cols']}x{cand['rows']}")
+            f"{cand['max_queue']:2d} {len(cand['queues']):2d} "
+            f"{a['p_win']*100:6.2f} {a['crit']:4d} {a['decep']:3d} "
+            f"{min(a['n_paths'], 99999999):8d} "
+            f"{difficulty(cand, sl):5.2f}  {cand['pen_w']}x{cand['pen_h']}")
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, 'levels.json'), 'w') as f:
