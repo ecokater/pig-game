@@ -1,0 +1,13 @@
+{
+  "seed": 20260721,
+  "levels": 1000,
+  "mud_levels": 300,
+  "mud_first_level": 121,
+  "mud_last_level": 896,
+  "mud_and_redirect_levels": 293,
+  "double_mud_levels": 113,
+  "difficulty_min": 5.461,
+  "difficulty_max": 44.565,
+  "high_similarity_pairs": 0,
+  "finale_untouched": true
+}

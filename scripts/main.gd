@@ -47,6 +47,7 @@ var occupied := {}         # Vector2i -> pig(仅圈内猪 + 可见等待猪)
 var walls := {}            # 边键 -> true
 var wall_list: Array = []  # [圈内格子, 朝外方向],供绘制
 var redirects := {}        # Vector2i -> Vector2i，猪头进入该格后改向
+var muds := {}             # Vector2i -> true，猪头进泥坑当场停下(再点可继续)
 var cellset := {}
 var steps_left := 0
 var game_over := false
@@ -54,6 +55,20 @@ var animating := false
 var bear: Node2D
 
 var _undo_stack: Array = []
+
+# 滑行轨迹预览(悬停在猪上时显示完整路径与落点)
+var _preview_pig: Node2D = null
+var _preview_cells: Array = []   # 头经过的格子
+var _preview_end: Array = []     # [落点尾格, 落点头格]
+var _overlay: Node2D             # 预览绘制层(盖在猪圈和猪之上)
+
+# 死局感知:每步后用限额求解器检测,无解时示警(不惩罚,只提示)
+var _doomed := false
+var _dfs_nodes := 0
+var _dfs_budget := 0
+var _dfs_overflow := false
+const DOOM_BUDGET := 30000
+const HINT_BUDGET := 400000
 
 var _title: Label
 var _steps_label: Label
@@ -135,6 +150,7 @@ static func _load_levels_from_json() -> Array:
 			"pen": _parse_v2i_array(lv["pen"]),
 			"queues": parsed_queues,
 			"redirects": parsed_redirects,
+			"muds": _parse_v2i_array(lv.get("muds", [])),
 		})
 	return result
 
@@ -167,6 +183,11 @@ func _ready() -> void:
 
 	_spawn_pigs()
 	_spawn_bear()
+
+	_overlay = PreviewOverlay.new()
+	_overlay.main = self
+	add_child(_overlay)
+
 	_build_ui()
 
 	if Meta.daily_pending:
@@ -197,6 +218,9 @@ func _load_level(lv: Dictionary) -> void:
 	redirects.clear()
 	for r in lv.get("redirects", []):
 		redirects[r[0]] = r[1]
+	muds.clear()
+	for m in lv.get("muds", []):
+		muds[m] = true
 	steps_left = max_steps
 	moves_made = 0
 
@@ -435,10 +459,14 @@ func _tap_pig(pig: Node2D) -> void:
 			pig.dir = redirects[pig.head]
 		# 两格身体沿折线路径跟随；转弯第一格仍按头尾连线显示朝向。
 		path.append([pig.center_pos(), pig.head - pig.tail])
+		if muds.has(pig.head):
+			break  # 泥坑:当场停下,再点一次才继续走
 
 	if not acted:
 		pig.wiggle()
 		return
+	_preview_pig = null
+	_overlay.queue_redraw()
 
 	_undo_stack.append(snap)
 	if not pig.entered:
@@ -453,6 +481,8 @@ func _tap_pig(pig: Node2D) -> void:
 	animating = false
 	_relayout_queues(true)
 	_check_state()
+	if not game_over:
+		_update_doom()
 
 
 func _all_inside() -> bool:
@@ -484,6 +514,102 @@ func _check_state() -> void:
 		_fail()
 
 
+# ---------- 死局感知 ----------
+## 每次局面变化后用限额精确求解器复查:确认无解就立刻示警,
+## 把"隐藏的欺骗深度"变成看得见的紧张感,而不是走了 8 步才发现被骗。
+
+func _update_doom() -> void:
+	if game_over:
+		return
+	var seq = _solve_from_current(DOOM_BUDGET)
+	var doomed_now: bool = (seq == null) and not _dfs_overflow
+	if doomed_now and not _doomed:
+		_toast("🐻 熊嗅到了危险……这条路走不通了,试试撤销")
+		if bear != null:
+			var tw := create_tween()
+			tw.tween_property(bear, "scale", Vector2(1.25, 1.25), 0.16)
+			tw.tween_property(bear, "scale", Vector2.ONE, 0.3)
+	_doomed = doomed_now
+	_steps_label.add_theme_color_override("font_color",
+			Color(1.0, 0.42, 0.36) if _doomed else Color(1, 1, 0.75))
+
+
+# ---------- 滑行轨迹预览 ----------
+## 鼠标悬停(手机上为按住)在可点的猪上时,显示它这一步会经过的格子、
+## 转向点和最终落点——箭头关不再靠脑内模拟。
+
+func _process(_dt: float) -> void:
+	_update_preview()
+
+
+func _update_preview() -> void:
+	if game_over or animating:
+		if _preview_pig != null:
+			_preview_pig = null
+			_overlay.queue_redraw()
+		return
+	var p := get_global_mouse_position()
+	var hover: Node2D = null
+	for pig in pigs:
+		if pig.visible and pig.hit_rect().has_point(p):
+			hover = pig
+			break
+	if hover == _preview_pig:
+		return
+	_preview_pig = hover
+	_preview_cells.clear()
+	_preview_end.clear()
+	if hover != null:
+		var t: Vector2i = hover.tail
+		var h: Vector2i = hover.head
+		var m: Vector2i = hover.dir
+		var occ := occupied.duplicate()
+		occ.erase(t)
+		occ.erase(h)
+		var moved := 0
+		while moved < 64:
+			var next: Vector2i = h + m
+			if is_inside(h) and not is_inside(next):
+				break
+			if walls.has(_edge_key(h, next)):
+				break
+			if occ.has(next):
+				break
+			t = h
+			h = next
+			moved += 1
+			_preview_cells.append(h)
+			if redirects.has(h):
+				m = redirects[h]
+			if muds.has(h):
+				break
+		if moved > 0:
+			_preview_end = [t, h]
+	_overlay.queue_redraw()
+
+
+class PreviewOverlay extends Node2D:
+	## 预览绘制层:路径圆点 + 落点双格投影,叠加在棋盘与猪之上。
+	var main: Node2D
+
+	func _draw() -> void:
+		if main == null or main._preview_pig == null \
+				or main._preview_end.is_empty():
+			return
+		var cell: float = main.cell_size
+		for c in main._preview_cells:
+			draw_circle(main.cell_center(c), cell * 0.07, Color(1, 1, 1, 0.55))
+		var pt: Vector2i = main._preview_end[0]
+		var ph: Vector2i = main._preview_end[1]
+		for c2 in [pt, ph]:
+			var pos: Vector2 = main.grid_origin + Vector2(c2) * cell
+			draw_rect(Rect2(pos + Vector2(7, 7) , Vector2(cell - 14, cell - 14)),
+					Color(1, 1, 1, 0.24))
+		var hp: Vector2 = main.grid_origin + Vector2(ph) * cell
+		draw_rect(Rect2(hp + Vector2(7, 7), Vector2(cell - 14, cell - 14)),
+				Color(1, 1, 1, 0.9), false, 4.0)
+
+
 # ---------- 道具:撤销 / 提示 / 加步 ----------
 
 func _do_undo() -> void:
@@ -507,17 +633,23 @@ func _do_undo() -> void:
 	for pg in pigs:
 		if pg.entered:
 			pg.position = pg.center_pos()
+	_preview_pig = null
+	_overlay.queue_redraw()
 	_update_steps_label()
 	_refresh_topbar()
 	_refresh_boosters()
+	_update_doom()
 
 
 func _do_hint() -> void:
 	if game_over or animating:
 		return
-	var seq = _solve_from_current()
+	var seq = _solve_from_current(HINT_BUDGET)
 	if seq == null or (seq as Array).is_empty():
-		_toast("当前局面在剩余步数内已无解,试试撤销")
+		if _dfs_overflow:
+			_toast("局面太复杂,提示一时算不出来…先凭直觉走一步?")
+		else:
+			_toast("当前局面在剩余步数内已无解,试试撤销")
 		return
 	if not Meta.use_booster("hint"):
 		_toast("金币不足")
@@ -546,13 +678,14 @@ func _do_extra_steps() -> void:
 	_update_steps_label()
 	_refresh_topbar()
 	_refresh_boosters()
+	_update_doom()
 
 
 # ---------- 实时求解(提示道具用) ----------
 ## 队列模型 DFS:状态 = (已入场猪 (tail,head,dir), 各队列剩余数)。
 ## 移动 = 释放某队队首 / 已入场猪再滑。找到第一条通关序列即返回。
 
-func _solve_from_current() -> Variant:
+func _solve_from_current(node_budget: int = HINT_BUDGET) -> Variant:
 	var entered: Array = []
 	var counts: Array = []
 	for pig in pigs:
@@ -561,6 +694,9 @@ func _solve_from_current() -> Variant:
 	for qi in queues.size():
 		counts.append(_waiting_list(qi).size())
 	entered.sort()
+	_dfs_nodes = 0
+	_dfs_budget = node_budget
+	_dfs_overflow = false
 	var visited := {}
 	return _dfs(entered, counts, steps_left, visited)
 
@@ -580,6 +716,8 @@ func _sim_slide(t: Vector2i, h: Vector2i, m: Vector2i, occ: Dictionary) -> Array
 		moved += 1
 		if redirects.has(h):
 			m = redirects[h]
+		if muds.has(h):
+			break
 	return [moved > 0, t, h, m]
 
 
@@ -603,6 +741,10 @@ func _dfs(entered: Array, counts: Array, remaining: int,
 	if int(visited.get(key, -1)) >= remaining:
 		return null
 	visited[key] = remaining
+	_dfs_nodes += 1
+	if _dfs_nodes > _dfs_budget:
+		_dfs_overflow = true
+		return null
 
 	var occ := {}
 	for p in entered:
@@ -766,6 +908,7 @@ func _on_btn_pressed() -> void:
 				_panel.visible = false
 				_update_steps_label()
 				_refresh_topbar()
+				_update_doom()
 			return
 		"advance":
 			if level_index < levels.size() - 1:

@@ -26,7 +26,7 @@ def shortest_state_path(level):
             won = state
             break
         for nxt in q_moves(level['pen'], walls, level['queues'], state,
-                           level['redirects'], []):
+                           level['redirects'], [], level.get('muds')):
             if nxt not in parent:
                 parent[nxt] = state
                 queue.append(nxt)
@@ -53,7 +53,7 @@ def main():
             multi_levels += 1
         for step, (state, hinted) in enumerate(zip(path, path[1:])):
             legal = q_moves(level['pen'], walls, level['queues'], state,
-                            level['redirects'], [])
+                            level['redirects'], [], level.get('muds'))
             if hinted not in legal:
                 raise AssertionError(
                     f'L{index + 1:04d} step {step}: hint is not legal')

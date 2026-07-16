@@ -1,6 +1,6 @@
 # Pigpen Puzzle 项目交接说明
 
-更新时间：2026-07-16
+更新时间：2026-07-17
 
 ## 1. 项目现状
 
@@ -12,8 +12,16 @@
 - 所有猪完全进入猪圈即胜利；
 - 有步数预算、三星评价、撤销、提示、加步、体力、金币、连胜和皮肤系统。
 
-当前唯一新增棋盘机制是 **Redirect 转向箭头**。Gate 栅栏门机制已经从游戏运行时、
-渲染和最终关卡数据中移除。
+当前棋盘机制有两个：**Redirect 转向箭头**与 **Mud 泥坑**。Gate 栅栏门机制已经
+从游戏运行时、渲染和最终关卡数据中移除。
+
+运行时还有两个"手感/公平性"系统（不改变规则,只改变信息呈现）：
+
+- **滑行轨迹预览**：悬停在可点的猪上时,`PreviewOverlay` 绘制这一步头部经过的
+  格子、转弯点与最终落点投影;
+- **死局感知**：每次局面变化后用限额(DOOM_BUDGET=30000 节点)DFS 复查,
+  确认无解则步数标签变红、熊放大提醒并弹一次 toast;超限则视为未知、不提示。
+  该检查只提示不惩罚,撤销/加步/续关后自动复查解除。
 
 ## 2. Redirect 规则
 
@@ -39,20 +47,36 @@
 - 第 701–1000 关全部含箭头；
 - 最后 100 关全部为三箭头。
 
+## 2b. Mud 泥坑规则
+
+- `levels.json` 中 `muds` 是格子列表,必须在圈内且不与箭头同格;
+- 猪头滑入泥坑格后**当场停下**(同一次滑行终止),再点该猪一次则从泥坑继续滑;
+- 泥坑是唯一能让猪停在"半路"的手段,可用来故意占道,代价是额外一步;
+- `tools/add_mud.py`(种子 20260721)向 L151–L900 难度带的 300 关编入 1–2 个
+  泥坑,逐关复算保证泥坑改变最优解(装饰性泥坑被拒),保持步数余量不变,
+  在线重查 D4 签名与相似度,难度分不越过 L901 的分数线;
+- 铺设后全量重排:泥坑首现 L121、最深 L896;293 关箭头+泥坑复合、113 关双泥坑;
+  三箭头决赛段(L901–L1000)不含泥坑,`finale_untouched=true`(见
+  `tools/mud_audit.json`)。
+
 ## 3. 关键运行时代码
 
 - `scripts/main.gd`
   - 读取 `levels.json`；
-  - 维护猪、队列、占用格和墙；
-  - `_tap_pig()` 执行真实连续滑动和箭头转向；
-  - `_solve_from_current()` / `_dfs()` 是提示功能使用的实时求解器；
+  - 维护猪、队列、占用格、墙、箭头和泥坑；
+  - `_tap_pig()` 执行真实连续滑动、箭头转向与泥坑急停；
+  - `_solve_from_current()` / `_dfs()` 是提示与死局感知共用的实时求解器,
+    带节点预算(提示 HINT_BUDGET=400000,死局检查 DOOM_BUDGET=30000),
+    超限置 `_dfs_overflow`,调用方把 null+overflow 视为"未知"而非"无解";
+  - `_update_preview()` + 内部类 `PreviewOverlay` 绘制悬停轨迹预览;
+  - `_update_doom()` 在每步/撤销/加步/续关后复查死局并联动 UI;
   - 提示状态包含猪尾格、头格、方向及各队剩余数量；
   - `_state_key()` 包含方向，避免多箭头下把不同朝向错误合并。
 - `scripts/pig.gd`
   - 两格猪显示、点击区域和分段折线动画；
   - `slide_path()` 支持一次滑行中的多次转向。
 - `scripts/pen_renderer.gd`
-  - 绘制猪圈、栅栏、入口和所有 Redirect 箭头。
+  - 绘制猪圈、栅栏、入口、所有 Redirect 箭头和 Mud 泥坑。
 - `scripts/meta.gd`
   - 体力、金币、星级、连胜、道具、皮肤和每日奖励。
 
@@ -66,7 +90,8 @@ Gate 相关运行时代码已经删除，最终 `levels.json` 也完全不含 `g
   "min": 14,
   "pen": [[0, 0], [0, 1]],
   "queues": [[[0, 0], [-1, 0], 2]],
-  "redirects": [[[2, 3], [1, 0]], [[4, 3], [0, 1]]]
+  "redirects": [[[2, 3], [1, 0]], [[4, 3], [0, 1]]],
+  "muds": [[1, 2]]
 }
 ```
 
@@ -105,8 +130,11 @@ python3 tools/generate_levels.py
    - 新候选仍需在线通过相似度检查。
 6. `tools/finalize_arrow_1000.py`
    - 一次性生成最终难度报告、相似度报告和扩展审计。
+7. `tools/add_mud.py`
+   - 向 L151–L900 难度带的 300 关编入解法必需的 Mud 泥坑(1–2 个),
+     在线重查 D4 签名与相似度,难度分不越过 L901,完成后全局重排并重写报告。
 
-固定种子主要为 `20260716`、`20260718`、`20260719`。
+固定种子主要为 `20260716`、`20260718`、`20260719`、`20260721`。
 
 ## 6. 难度评测
 
@@ -120,7 +148,7 @@ python3 tools/generate_levels.py
 - `decep`：走错后还可继续多少步才暴露死局；
 - `paths`：预算内通关序列数；
 - `search_states`：找到最短解前访问的状态数；
-- 猪数、最深队列和 Redirect 数量。
+- 猪数、最深队列、Redirect 数量和 Mud 数量(难度项 +0.40×Mud数)。
 
 最终难度严格非递减：
 
@@ -180,7 +208,7 @@ multi_redirect_levels=450
 ```
 
 它会重建每关最短状态路径，逐步确认提示动作合法，且提示后的剩余路径不超过预算。
-报告保存于 `tools/hint_report.txt`。
+报告保存于 `tools/hint_report.txt`。当前审计:`path_states=10632`。
 
 ## 9. 当前完整验证结果
 
@@ -190,13 +218,14 @@ python3 tools/verify_hints.py
 python3 -m unittest tools/test_mechanics.py
 ```
 
-最近一次结果：
+最近一次结果（泥坑编入后,2026-07-17）：
 
 ```text
-ALL 1000 LEVELS OK (含 D4 旋转/镜像全查重)
+ALL 1000 LEVELS OK (含 D4 旋转/镜像全查重与泥坑非装饰检查)
 难度有序 5.461 -> 44.565
 超阈值相似对 0
-ALL 1000 LEVEL HINTS OK
+ALL 1000 LEVEL HINTS OK; path_states=10632; multi_redirect_levels=450
+unittest 6/6 OK(含泥坑急停、二次点击续走、箭头+泥坑链)
 ```
 
 另已通过：
@@ -209,8 +238,9 @@ ALL 1000 LEVEL HINTS OK
 
 - `levels.json`：最终 1000 关，约 1.2 MB；
 - `tools/levels_evaluation_after.md`：最终逐关难度/相似度报告；
-- `tools/levels_report.txt`：紧凑逐关指标；
-- `tools/expansion_audit.json`：最终规模、箭头覆盖和难度审计；
+- `tools/levels_report.txt`：紧凑逐关指标（含 md 泥坑列）；
+- `tools/expansion_audit.json`：箭头扩展阶段的规模与难度审计；
+- `tools/mud_audit.json`：泥坑编入阶段的覆盖与决赛段保护审计；
 - `tools/hint_report.txt`：提示正确性审计；
 - `tools/LEVEL_EVALUATION.md`：评测方法定义；
 - `README.md`：玩法和运行说明。

@@ -93,14 +93,16 @@ def build_walls(pen_set, openings):
 
 
 def _slide(pen_set, walls, occ, t, h, m, redirects=None, gates=None,
-           open_gates=0):
+           open_gates=0, muds=None):
     """从 (t,h) 沿 m 滑到底。
 
-    箭头在猪头进入格子后立即改向；关闭门被撞开但本次停在门前。
+    箭头在猪头进入格子后立即改向；泥坑让猪头当场停下(再点一次可继续走);
+    关闭门被撞开但本次停在门前。
     返回 (是否产生操作, t, h, 最终方向, 已开门位图)。
     """
     redirects = redirects or {}
     gates = gates or {}
+    muds = muds or ()
     moved = 0
     while moved < 100:
         nxt = add(h, m)
@@ -118,10 +120,13 @@ def _slide(pen_set, walls, occ, t, h, m, redirects=None, gates=None,
         moved += 1
         if h in redirects:
             m = redirects[h]
+        if h in muds:
+            break
     return moved > 0, t, h, m, open_gates
 
 
-def q_moves(pen_set, walls, queues, state, redirects=None, gate_edges=None):
+def q_moves(pen_set, walls, queues, state, redirects=None, gate_edges=None,
+            muds=None):
     """枚举当前状态的所有合法移动,返回 [(新状态)]。
     state = (entered, counts):entered = ((t,h,m), ...) 排序元组。"""
     if len(state) == 2:  # 兼容无机制旧调用
@@ -148,7 +153,7 @@ def q_moves(pen_set, walls, queues, state, redirects=None, gate_edges=None):
             continue
         m = neg(d)
         acted, t, h, m, ng = _slide(
-            pen_set, walls, occ, t0, h0, m, redirects, gates, open_gates)
+            pen_set, walls, occ, t0, h0, m, redirects, gates, open_gates, muds)
         if not acted:
             continue
         ne = tuple(sorted(entered + ((t, h, m),)))
@@ -159,7 +164,7 @@ def q_moves(pen_set, walls, queues, state, redirects=None, gate_edges=None):
     for i, (t, h, m) in enumerate(entered):
         occ2 = occ - {t, h}
         acted, nt, nh, nm, ng = _slide(
-            pen_set, walls, occ2, t, h, m, redirects, gates, open_gates)
+            pen_set, walls, occ2, t, h, m, redirects, gates, open_gates, muds)
         if not acted:
             continue
         ne = tuple(sorted(entered[:i] + entered[i + 1:] + ((nt, nh, nm),)))
@@ -174,7 +179,8 @@ def q_won(pen_set, state):
     return all(t in pen_set and h in pen_set for t, h, m in entered)
 
 
-def solve(pen_set, walls, queues, max_depth=60, redirects=None, gate_edges=None):
+def solve(pen_set, walls, queues, max_depth=60, redirects=None, gate_edges=None,
+          muds=None):
     """BFS 最短解;返回 最优步数 或 None。"""
     init = ((), tuple(q[2] for q in queues), 0)
     seen = {init}
@@ -187,7 +193,8 @@ def solve(pen_set, walls, queues, max_depth=60, redirects=None, gate_edges=None)
             continue
         if len(seen) > BFS_NODE_CAP:
             return None
-        for ns in q_moves(pen_set, walls, queues, state, redirects, gate_edges):
+        for ns in q_moves(pen_set, walls, queues, state, redirects, gate_edges,
+                          muds):
             if ns not in seen:
                 seen.add(ns)
                 q.append((ns, depth + 1))
@@ -200,7 +207,8 @@ class TooLarge(Exception):
     pass
 
 
-def analyze(pen_set, walls, queues, budget, redirects=None, gate_edges=None):
+def analyze(pen_set, walls, queues, budget, redirects=None, gate_edges=None,
+            muds=None):
     """返回 {p_win, n_paths, crit, decep} 或 None(预算内不可解);
     状态数超过 DP_STATE_CAP 抛 TooLarge。"""
     init = ((), tuple(q[2] for q in queues), 0)
@@ -210,7 +218,8 @@ def analyze(pen_set, walls, queues, budget, redirects=None, gate_edges=None):
     def moves(state):
         r = moves_memo.get(state)
         if r is None:
-            r = q_moves(pen_set, walls, queues, state, redirects, gate_edges)
+            r = q_moves(pen_set, walls, queues, state, redirects, gate_edges,
+                        muds)
             moves_memo[state] = r
             if len(moves_memo) > DP_STATE_CAP:
                 raise TooLarge()
@@ -322,10 +331,11 @@ def _xform(c, k):
     return (-y, -x)         # 副对角镜像
 
 
-def canon_sig(pen_set, queues, redirects=None, gate_edges=None):
+def canon_sig(pen_set, queues, redirects=None, gate_edges=None, muds=None):
     """D4 八变换下的规范签名:任意两关(含彼此的旋转/镜像)都不同。"""
     redirects = redirects or {}
     gate_edges = gate_edges or []
+    muds = muds or ()
     best = None
     for k in range(8):
         pen = [_xform(c, k) for c in pen_set]
@@ -337,13 +347,15 @@ def canon_sig(pen_set, queues, redirects=None, gate_edges=None):
                              (o[0] - mx, o[1] - my), n) for c, o, n in qs))
         rs_n = tuple(sorted(((_xform(c, k)[0] - mx, _xform(c, k)[1] - my),
                              _xform(d, k)) for c, d in redirects.items()))
+        ms_n = tuple(sorted((_xform(c, k)[0] - mx, _xform(c, k)[1] - my)
+                            for c in muds))
         gs_n = []
         for a, b in gate_edges:
             ta, tb = _xform(a, k), _xform(b, k)
             edge = tuple(sorted(((ta[0] - mx, ta[1] - my),
                                  (tb[0] - mx, tb[1] - my))))
             gs_n.append(edge)
-        sig = (pen_n, qs_n, rs_n, tuple(sorted(gs_n)))
+        sig = (pen_n, qs_n, rs_n, ms_n, tuple(sorted(gs_n)))
         if best is None or sig < best:
             best = sig
     return best

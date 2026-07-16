@@ -27,6 +27,10 @@ func _draw() -> void:
 	for c in main.redirects:
 		_draw_redirect(c, main.redirects[c], s)
 
+	# 泥坑：猪头进坑当场停下，再点一次继续走。
+	for c in main.muds:
+		_draw_mud(c, s)
+
 	var posts := {}
 
 	# 栅栏
@@ -67,6 +71,23 @@ func _edge_points(c: Vector2i, d: Vector2i) -> Array:
 func _draw_bar(a: Vector2, b: Vector2, s: float) -> void:
 	draw_line(a, b, Color("#8f4d15"), 24.0 * s)
 	draw_line(a, b, Color("#e0862d"), 15.0 * s)
+
+
+func _draw_mud(c: Vector2i, s: float) -> void:
+	var center: Vector2 = main.cell_center(c)
+	draw_colored_polygon(_ellipse(center, 56.0 * s, 42.0 * s), Color("#8a5a2b"))
+	draw_colored_polygon(_ellipse(center + Vector2(0, 3) * s, 42.0 * s, 30.0 * s),
+			Color("#6e4620"))
+	for off in [Vector2(-18, -8), Vector2(14, -14), Vector2(4, 12)]:
+		draw_circle(center + off * s, 5.5 * s, Color("#a9743c"))
+
+
+func _ellipse(center: Vector2, rx: float, ry: float) -> PackedVector2Array:
+	var pts := PackedVector2Array()
+	for i in 22:
+		var a := TAU * i / 22.0
+		pts.append(center + Vector2(cos(a) * rx, sin(a) * ry))
+	return pts
 
 
 func _draw_redirect(c: Vector2i, d: Vector2i, s: float) -> void:

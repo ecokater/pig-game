@@ -9,7 +9,8 @@
   4. BFS 可解,最优步数 == 存档 min ≤ 步数预算;
   5. 精确胜率 p_win > 0(全状态空间 DP,非抽样);
   6. D4 全变换(旋转 90/180/270 + 镜像)规范签名全部关卡两两不同。
-  7. Redirect 必须改变最优解，禁止装饰性机制；最终数据不得含 Gate。
+  7. Redirect / 泥坑必须改变最优解，禁止装饰性机制；泥坑必须在圈内且
+     不与箭头同格；最终数据不得含 Gate。
 
 难度与相似度终检:
   使用 evaluate_levels.py 的最终评分检查严格非递减，并要求超阈值相似对为 0。
@@ -41,6 +42,7 @@ def load_levels():
             'pen': [tuple(c) for c in lv['pen']],
             'queues': [(tuple(c), tuple(d), int(n)) for c, d, n in lv['queues']],
             'redirects': {tuple(c): tuple(d) for c, d in lv.get('redirects', [])},
+            'muds': set(map(tuple, lv.get('muds', []))),
             'gates': [],
         })
     return levels
@@ -102,23 +104,30 @@ def main():
                     break
                 used.add(cell)
 
-        # D4 全变换查重
+        # 机制格合法性
+        muds = lv['muds']
         for c, d in redirects.items():
             if c not in pen_set or d not in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 errs.append("箭头位置或方向非法")
+        for c in muds:
+            if c not in pen_set:
+                errs.append("泥坑必须在圈内")
+            if c in redirects:
+                errs.append("泥坑与箭头不能同格")
         for a, b in gates:
             if (a not in pen_set or b not in pen_set
                     or abs(a[0] - b[0]) + abs(a[1] - b[1]) != 1):
                 errs.append("门必须位于两个相邻圈内格之间")
 
-        sig = canon_sig(pen_set, queues, redirects, gates)
+        sig = canon_sig(pen_set, queues, redirects, gates, muds)
         if sig in canons:
             errs.append(f"与 L{canons[sig]+1:03d} 旋转/镜像同构")
         canons[sig] = i
 
         # 可解性与精确分析
         walls = build_walls(pen_set, [(c, d) for c, d, _ in queues])
-        min_steps = solve(pen_set, walls, queues, redirects=redirects, gate_edges=gates)
+        min_steps = solve(pen_set, walls, queues, redirects=redirects,
+                          gate_edges=gates, muds=muds)
         a = None
         if min_steps is None:
             errs.append("BFS 无解")
@@ -130,16 +139,25 @@ def main():
             # 机制必须参与解法，禁止只摆一个不影响路径的装饰物。
             if redirects:
                 without_redirect = solve(
-                    pen_set, walls, queues, redirects={}, gate_edges=gates)
+                    pen_set, walls, queues, redirects={}, gate_edges=gates,
+                    muds=muds)
                 if without_redirect == min_steps:
                     errs.append("箭头未改变最优解")
+            if muds:
+                without_mud = solve(
+                    pen_set, walls, queues, redirects=redirects,
+                    gate_edges=gates, muds=set())
+                if without_mud == min_steps:
+                    errs.append("泥坑未改变最优解")
             if gates:
                 without_gate = solve(
-                    pen_set, walls, queues, redirects=redirects, gate_edges=[])
+                    pen_set, walls, queues, redirects=redirects, gate_edges=[],
+                    muds=muds)
                 if without_gate is None or without_gate >= min_steps:
                     errs.append("门未形成额外开门接力")
             try:
-                a = analyze(pen_set, walls, queues, lv['steps'], redirects, gates)
+                a = analyze(pen_set, walls, queues, lv['steps'], redirects,
+                            gates, muds)
             except TooLarge:
                 errs.append("状态空间超限")
             if a is None and not errs:

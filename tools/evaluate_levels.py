@@ -33,6 +33,7 @@ def load_levels(path=None):
                        for c, d, n in level['queues']],
             'redirects': {tuple(c): tuple(d)
                           for c, d in level.get('redirects', [])},
+            'muds': set(map(tuple, level.get('muds', []))),
             'gates': [tuple(sorted((tuple(a), tuple(b))))
                       for a, b in level.get('gates', [])],
             'raw': level,
@@ -68,8 +69,9 @@ def transition_token(level, state, nxt):
     dist_bucket = min(distance, 3)
     fully_inside = bool(new_pig and new_pig[0] in level['pen']
                         and new_pig[1] in level['pen'])
+    in_mud = bool(new_pig and new_pig[1] in level.get('muds', ()))
     return ('Q' if released else 'P', 'R' if turned else '-', str(dist_bucket),
-            'I' if fully_inside else 'X')
+            'I' if fully_inside else 'X', 'M' if in_mud else '-')
 
 
 def shortest_method(level):
@@ -85,7 +87,8 @@ def shortest_method(level):
             won = state
             break
         for nxt in q_moves(level['pen'], walls, level['queues'], state,
-                           level['redirects'], level['gates']):
+                           level['redirects'], level['gates'],
+                           level.get('muds')):
             if nxt not in parent:
                 parent[nxt] = state
                 action[nxt] = transition_token(level, state, nxt)
@@ -110,7 +113,8 @@ def difficulty(level, metrics, search_states):
         + 0.55 * metrics['crit'] + 0.28 * metrics['decep']
         + 0.45 * (max(q[2] for q in level['queues']) - 1)
         + 0.45 * scarcity + 0.18 * math.log10(1 + search_states)
-        + 0.35 * len(level['redirects']), 3)
+        + 0.35 * len(level['redirects'])
+        + 0.40 * len(level.get('muds') or ()), 3)
 
 
 def _normalized_shape(pen, transform):
@@ -147,7 +151,8 @@ def structural_similarity(a, b):
     queues = _multiset_similarity(
         [q[2] for q in a['queues']], [q[2] for q in b['queues']])
     mechanics = 1.0 - min(1.0,
-        abs(len(a['redirects']) - len(b['redirects'])) / 2.0)
+        (abs(len(a['redirects']) - len(b['redirects']))
+         + abs(len(a.get('muds') or ()) - len(b.get('muds') or ()))) / 2.0)
     scale = 1.0 - min(1.0, abs(len(a['pen']) - len(b['pen']))
                       / max(len(a['pen']), len(b['pen']), 1))
     return 0.50 * shape + 0.25 * queues + 0.15 * mechanics + 0.10 * scale
@@ -173,7 +178,8 @@ def evaluate(levels):
         walls = build_walls(level['pen'],
                             [(c, d) for c, d, _ in level['queues']])
         metrics = analyze(level['pen'], walls, level['queues'], level['steps'],
-                          level['redirects'], level['gates'])
+                          level['redirects'], level['gates'],
+                          level.get('muds'))
         method, states = shortest_method(level)
         rows.append({'index': i, 'level': level, 'metrics': metrics,
                      'method': method, 'states': states,
@@ -198,16 +204,17 @@ def report(rows, pairs):
         '# 关卡难度与相似度评测', '',
         '阈值：综合相似度 >= %.2f，或解法 >= %.2f 且结构 >= 0.68。'
         % (HIGH_SIMILARITY, HIGH_METHOD), '',
-        '| 关卡 | 难度 | 猪 | 最优 | p_win | crit | decep | Redirect |',
-        '|---:|---:|---:|---:|---:|---:|---:|---:|',
+        '| 关卡 | 难度 | 猪 | 最优 | p_win | crit | decep | Redirect | Mud |',
+        '|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
     ]
     for row in rows:
         level, m = row['level'], row['metrics']
-        lines.append('| %03d | %.3f | %d | %d | %.4f | %d | %d | %d |'
+        lines.append('| %03d | %.3f | %d | %d | %.4f | %d | %d | %d | %d |'
                      % (row['index'] + 1, row['difficulty'],
                         sum(q[2] for q in level['queues']), level['min'],
                         m['p_win'], m['crit'], m['decep'],
-                        len(level['redirects'])))
+                        len(level['redirects']),
+                        len(level.get('muds') or ())))
     lines += ['', '## 超阈值相似关卡', '']
     if not pairs:
         lines.append('无。')

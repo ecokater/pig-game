@@ -30,6 +30,7 @@ def parse(raw):
         'queues': [(tuple(c), tuple(d), int(n)) for c, d, n in raw['queues']],
         'redirects': {tuple(c): tuple(d)
                       for c, d in raw.get('redirects', [])},
+        'muds': set(map(tuple, raw.get('muds', []))),
         'gates': [tuple(sorted((tuple(a), tuple(b))))
                   for a, b in raw.get('gates', [])],
         'raw': raw,
