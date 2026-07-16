@@ -1,5 +1,5 @@
 extends Node2D
-## 主场景:反向 Arrow Puzzle,共 100 关(队列版)。
+## 主场景:反向 Arrow Puzzle,共 1000 关(队列版)。
 ## 每个开口外是一条 FIFO 猪队:只有队首的猪能被点击释放进圈,
 ## 进圈后沿固定方向滑到底;后面的猪自动补位。
 ## 屏幕上每队最多显示 2 头,其余收纳成 🐷×n 徽章(不可点击)。
@@ -46,6 +46,7 @@ var badges: Array = []     # 每个开口的 🐷×n 徽章 Label
 var occupied := {}         # Vector2i -> pig(仅圈内猪 + 可见等待猪)
 var walls := {}            # 边键 -> true
 var wall_list: Array = []  # [圈内格子, 朝外方向],供绘制
+var redirects := {}        # Vector2i -> Vector2i，猪头进入该格后改向
 var cellset := {}
 var steps_left := 0
 var game_over := false
@@ -122,11 +123,18 @@ static func _load_levels_from_json() -> Array:
 				"dir": Vector2i(int(q[1][0]), int(q[1][1])),
 				"count": int(q[2]),
 			})
+		var parsed_redirects: Array = []
+		for r in lv.get("redirects", []):
+			parsed_redirects.append([
+				Vector2i(int(r[0][0]), int(r[0][1])),
+				Vector2i(int(r[1][0]), int(r[1][1])),
+			])
 		result.append({
 			"steps": int(lv["steps"]),
 			"min": int(lv.get("min", lv["steps"])),
 			"pen": _parse_v2i_array(lv["pen"]),
 			"queues": parsed_queues,
+			"redirects": parsed_redirects,
 		})
 	return result
 
@@ -186,6 +194,9 @@ func _load_level(lv: Dictionary) -> void:
 	queues = lv["queues"]
 	max_steps = lv["steps"]
 	min_steps = lv["min"]
+	redirects.clear()
+	for r in lv.get("redirects", []):
+		redirects[r[0]] = r[1]
 	steps_left = max_steps
 	moves_made = 0
 
@@ -401,9 +412,11 @@ func _tap_pig(pig: Node2D) -> void:
 	# 移动前快照,供撤销道具回滚
 	var snap := {"steps": steps_left, "moves": moves_made, "pigs": []}
 	for pg in pigs:
-		snap["pigs"].append([pg, pg.tail, pg.head, pg.entered])
+		snap["pigs"].append([pg, pg.tail, pg.head, pg.dir, pg.entered])
 
 	var moved := 0
+	var acted := false
+	var path: Array = []
 	while moved < 64:
 		var next: Vector2i = pig.head + pig.dir
 		if is_inside(pig.head) and not is_inside(next):
@@ -417,8 +430,13 @@ func _tap_pig(pig: Node2D) -> void:
 		pig.head = next
 		occupied[next] = pig
 		moved += 1
+		acted = true
+		if redirects.has(pig.head):
+			pig.dir = redirects[pig.head]
+		# 两格身体沿折线路径跟随；转弯第一格仍按头尾连线显示朝向。
+		path.append([pig.center_pos(), pig.head - pig.tail])
 
-	if moved == 0:
+	if not acted:
 		pig.wiggle()
 		return
 
@@ -430,7 +448,8 @@ func _tap_pig(pig: Node2D) -> void:
 	moves_made += 1
 	_update_steps_label()
 	animating = true
-	await pig.slide_to_cells(0.12 + 0.05 * moved)
+	if moved > 0:
+		await pig.slide_path(path, 0.12 + 0.05 * moved)
 	animating = false
 	_relayout_queues(true)
 	_check_state()
@@ -478,7 +497,9 @@ func _do_undo() -> void:
 		var pg: Node2D = e[0]
 		pg.tail = e[1]
 		pg.head = e[2]
-		pg.entered = e[3]
+		pg.dir = e[3]
+		pg.entered = e[4]
+		pg.rotation = Vector2(pg.head - pg.tail).angle() + PI / 2.0
 	steps_left = snap["steps"]
 	moves_made = snap["moves"]
 	_rebuild_occupied()
@@ -557,10 +578,13 @@ func _sim_slide(t: Vector2i, h: Vector2i, m: Vector2i, occ: Dictionary) -> Array
 		t = h
 		h = next
 		moved += 1
-	return [moved, t, h]
+		if redirects.has(h):
+			m = redirects[h]
+	return [moved > 0, t, h, m]
 
 
-func _dfs(entered: Array, counts: Array, remaining: int, visited: Dictionary) -> Variant:
+func _dfs(entered: Array, counts: Array, remaining: int,
+		visited: Dictionary) -> Variant:
 	var done := true
 	for p in entered:
 		if not (is_inside(p[0]) and is_inside(p[1])):
@@ -596,10 +620,10 @@ func _dfs(entered: Array, counts: Array, remaining: int, visited: Dictionary) ->
 		if occ.has(h0) or occ.has(t0):
 			continue
 		var r := _sim_slide(t0, h0, -d, occ)
-		if r[0] == 0:
+		if not r[0]:
 			continue
 		var ne := entered.duplicate(true)
-		ne.append([r[1], r[2], -d])
+		ne.append([r[1], r[2], r[3]])
 		ne.sort()
 		var nc := counts.duplicate()
 		nc[qi] -= 1
@@ -616,10 +640,10 @@ func _dfs(entered: Array, counts: Array, remaining: int, visited: Dictionary) ->
 		occ2.erase(p[0])
 		occ2.erase(p[1])
 		var r := _sim_slide(p[0], p[1], p[2], occ2)
-		if r[0] == 0:
+		if not r[0]:
 			continue
 		var ne := entered.duplicate(true)
-		ne[i] = [r[1], r[2], p[2]]
+		ne[i] = [r[1], r[2], r[3]]
 		ne.sort()
 		var sub = _dfs(ne, counts, remaining - 1, visited)
 		if sub != null:
@@ -632,7 +656,8 @@ func _dfs(entered: Array, counts: Array, remaining: int, visited: Dictionary) ->
 func _state_key(entered: Array, counts: Array) -> String:
 	var s := ""
 	for p in entered:
-		s += "%d,%d,%d,%d;" % [p[0].x, p[0].y, p[1].x, p[1].y]
+		s += "%d,%d,%d,%d,%d,%d;" % [p[0].x, p[0].y, p[1].x, p[1].y,
+			p[2].x, p[2].y]
 	s += "|"
 	for c in counts:
 		s += "%d," % c
@@ -840,7 +865,10 @@ func _build_ui() -> void:
 	_update_steps_label()
 
 	var hint := Label.new()
-	hint.text = "点击队首的小猪送它进圈 · 顺序很重要！"
+	if not redirects.is_empty():
+		hint.text = "蓝色箭头会改变滑行方向 · 先规划谁去触发！"
+	else:
+		hint.text = "点击队首的小猪送它进圈 · 顺序很重要！"
 	_style_label(hint, 26, Color(1, 1, 1, 0.9))
 	hint.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
 	hint.offset_top = -50.0

@@ -8,10 +8,11 @@
   3. 圈外净空:各开口的可见槽位 + 徽章格不压猪圈、互不重叠;
   4. BFS 可解,最优步数 == 存档 min ≤ 步数预算;
   5. 精确胜率 p_win > 0(全状态空间 DP,非抽样);
-  6. D4 全变换(旋转 90/180/270 + 镜像)规范签名 100 关两两不同。
+  6. D4 全变换(旋转 90/180/270 + 镜像)规范签名全部关卡两两不同。
+  7. Redirect 必须改变最优解，禁止装饰性机制；最终数据不得含 Gate。
 
-难度复验(报告输出):
-  p_win / crit / decep / paths / 难度分,检查各世界内难度大体递增。
+难度与相似度终检:
+  使用 evaluate_levels.py 的最终评分检查严格非递减，并要求超阈值相似对为 0。
 
 用法:python3 tools/verify_levels.py
 """
@@ -32,11 +33,15 @@ def load_levels():
         raw = json.load(f)
     levels = []
     for lv in raw:
+        if 'gates' in lv:
+            raise ValueError("最终关卡数据禁止包含 Gate 字段")
         levels.append({
             'steps': lv['steps'],
             'min': lv['min'],
             'pen': [tuple(c) for c in lv['pen']],
             'queues': [(tuple(c), tuple(d), int(n)) for c, d, n in lv['queues']],
+            'redirects': {tuple(c): tuple(d) for c, d in lv.get('redirects', [])},
+            'gates': [],
         })
     return levels
 
@@ -62,12 +67,12 @@ def main():
     print("-" * 76)
 
     all_ok = True
-    prev_diff = {}
-    warns = []
     canons = {}
     for i, lv in enumerate(levels):
         pen_set = set(lv['pen'])
         queues = lv['queues']
+        redirects = lv['redirects']
+        gates = [tuple(sorted(g)) for g in lv['gates']]
         n = sum(cnt for _, _, cnt in queues)
         errs = []
 
@@ -98,14 +103,22 @@ def main():
                 used.add(cell)
 
         # D4 全变换查重
-        sig = canon_sig(pen_set, queues)
+        for c, d in redirects.items():
+            if c not in pen_set or d not in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                errs.append("箭头位置或方向非法")
+        for a, b in gates:
+            if (a not in pen_set or b not in pen_set
+                    or abs(a[0] - b[0]) + abs(a[1] - b[1]) != 1):
+                errs.append("门必须位于两个相邻圈内格之间")
+
+        sig = canon_sig(pen_set, queues, redirects, gates)
         if sig in canons:
             errs.append(f"与 L{canons[sig]+1:03d} 旋转/镜像同构")
         canons[sig] = i
 
         # 可解性与精确分析
         walls = build_walls(pen_set, [(c, d) for c, d, _ in queues])
-        min_steps = solve(pen_set, walls, queues)
+        min_steps = solve(pen_set, walls, queues, redirects=redirects, gate_edges=gates)
         a = None
         if min_steps is None:
             errs.append("BFS 无解")
@@ -114,8 +127,19 @@ def main():
         elif min_steps > lv['steps']:
             errs.append(f"最优 {min_steps} > 预算 {lv['steps']}")
         else:
+            # 机制必须参与解法，禁止只摆一个不影响路径的装饰物。
+            if redirects:
+                without_redirect = solve(
+                    pen_set, walls, queues, redirects={}, gate_edges=gates)
+                if without_redirect == min_steps:
+                    errs.append("箭头未改变最优解")
+            if gates:
+                without_gate = solve(
+                    pen_set, walls, queues, redirects=redirects, gate_edges=[])
+                if without_gate is None or without_gate >= min_steps:
+                    errs.append("门未形成额外开门接力")
             try:
-                a = analyze(pen_set, walls, queues, lv['steps'])
+                a = analyze(pen_set, walls, queues, lv['steps'], redirects, gates)
             except TooLarge:
                 errs.append("状态空间超限")
             if a is None and not errs:
@@ -125,10 +149,6 @@ def main():
         if a is not None:
             diff = (1.2 * n + 3.0 * (1 - a['p_win']) + 0.5 * a['crit']
                     + 0.25 * a['decep'] + 0.5 * (max_q - 1))
-            if n in prev_diff and diff < prev_diff[n] - 0.9:
-                warns.append(f"L{i+1:03d} 难度分回落 "
-                             f"{prev_diff[n]:.2f}->{diff:.2f}")
-            prev_diff[n] = max(diff, prev_diff.get(n, 0.0))
             print(f"L{i+1:03d} {n:4d} {min_steps:4d} {lv['steps']:3d} "
                   f"{max_q:2d} {len(queues):2d} {a['p_win']*100:6.2f} "
                   f"{a['crit']:4d} {a['decep']:3d} "
@@ -141,8 +161,18 @@ def main():
             all_ok = False
 
     print("-" * 76)
-    for w in warns:
-        print("警告:", w)
+    from evaluate_levels import evaluate, load_levels as load_evaluation_levels
+    ranked, similar_pairs = evaluate(load_evaluation_levels())
+    scores = [row['difficulty'] for row in ranked]
+    if any(a > b for a, b in zip(scores, scores[1:])):
+        print("失败:最终难度分没有按非递减顺序排列")
+        all_ok = False
+    if similar_pairs:
+        print(f"失败:仍有 {len(similar_pairs)} 对超阈值相似关卡")
+        all_ok = False
+    if all_ok:
+        print(f"难度有序 {scores[0]:.3f} -> {scores[-1]:.3f}; "
+              "超阈值相似对 0")
     if all_ok and len(canons) == len(levels):
         print(f"ALL {len(levels)} LEVELS OK(含 D4 旋转/镜像全查重)")
         sys.exit(0)

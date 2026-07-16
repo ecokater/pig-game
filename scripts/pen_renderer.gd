@@ -23,6 +23,10 @@ func _draw() -> void:
 		draw_rect(Rect2(pos + Vector2(3, 3) * s, Vector2(cell, cell) - Vector2(6, 6) * s),
 				Color("#d9b427"), false, 3.0 * s)
 
+	# 改向箭头：铺在格子中央，不遮挡猪圈边界。
+	for c in main.redirects:
+		_draw_redirect(c, main.redirects[c], s)
+
 	var posts := {}
 
 	# 栅栏
@@ -63,3 +67,22 @@ func _edge_points(c: Vector2i, d: Vector2i) -> Array:
 func _draw_bar(a: Vector2, b: Vector2, s: float) -> void:
 	draw_line(a, b, Color("#8f4d15"), 24.0 * s)
 	draw_line(a, b, Color("#e0862d"), 15.0 * s)
+
+
+func _draw_redirect(c: Vector2i, d: Vector2i, s: float) -> void:
+	var center: Vector2 = main.cell_center(c)
+	var forward := Vector2(d).normalized()
+	var side := Vector2(-forward.y, forward.x)
+	var tip := center + forward * 48.0 * s
+	var neck := center + forward * 9.0 * s
+	var back := center - forward * 42.0 * s
+	var pts := PackedVector2Array([
+		tip, neck + side * 34.0 * s, neck + side * 15.0 * s,
+		back + side * 15.0 * s, back - side * 15.0 * s,
+		neck - side * 15.0 * s, neck - side * 34.0 * s,
+	])
+	draw_colored_polygon(pts, Color("#2f9fb3"))
+	var outline := pts.duplicate()
+	outline.append(pts[0])
+	draw_polyline(outline, Color("#176170"), 5.0 * s, true)
+

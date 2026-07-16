@@ -37,10 +37,17 @@ func hit_rect() -> Rect2:
 	return Rect2(main.grid_origin + mn * main.cell_size, sz * main.cell_size)
 
 
-func slide_to_cells(dur: float) -> void:
+func slide_path(path: Array, dur: float) -> void:
+	## 箭头可令一次滑行出现多个直角转折，逐段移动并同步旋转。
+	if path.is_empty():
+		return
 	var tw := create_tween()
-	tw.tween_property(self, "position", center_pos(), dur)\
-		.set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+	var part: float = dur / path.size()
+	for step in path:
+		tw.tween_property(self, "position", step[0], part)\
+			.set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+		tw.parallel().tween_property(self, "rotation",
+				Vector2(step[1]).angle() + PI / 2.0, part * 0.75)
 	await tw.finished
 
 

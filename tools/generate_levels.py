@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-小猪进圈 · 100 关生成器 v4(队列模型 + 8×10 猪圈 + D4 全变换去重)
+小猪进圈 · 1000 关生成器（100 关策划种子 + 900 关严格扩展）
 
 与 v3 的区别:
 - 队列模型:每个开口是一条 FIFO 猪队(数量不限)。只有队首的猪可以被点击
   释放进圈;其余的猪自动排队补位,不占棋盘格。游戏里排不下的用 🐷×n 徽章
   收纳显示。被收纳(未现身)的猪不可点击 —— 分析模型与游戏行为完全一致。
 - 猪圈本体 bbox ≤ 8 宽 × 10 高(竖屏),圈外只需要给可见槽位留出直线净空。
-- 去重:每关按 D4 群(旋转 90/180/270 + 四种镜像)取规范签名,100 关两两
+- 去重:每关按 D4 群(旋转 90/180/270 + 四种镜像)取规范签名,最终 1000 关两两
   不同;另要求"玩法特征"(形状类 + 猪数 + 开口数 + 队列构成)全局唯一,
   保证每一关玩起来都有差异。
 - 难度依旧全部来自精确状态空间分析(p_win / crit / decep / paths),无抽样。
@@ -92,8 +92,15 @@ def build_walls(pen_set, openings):
     return walls
 
 
-def _slide(pen_set, walls, occ, t, h, m):
-    """从 (t,h) 沿 m 滑到底;occ 为其他猪占格。返回 (moved, t, h)。"""
+def _slide(pen_set, walls, occ, t, h, m, redirects=None, gates=None,
+           open_gates=0):
+    """从 (t,h) 沿 m 滑到底。
+
+    箭头在猪头进入格子后立即改向；关闭门被撞开但本次停在门前。
+    返回 (是否产生操作, t, h, 最终方向, 已开门位图)。
+    """
+    redirects = redirects or {}
+    gates = gates or {}
     moved = 0
     while moved < 100:
         nxt = add(h, m)
@@ -101,17 +108,30 @@ def _slide(pen_set, walls, occ, t, h, m):
             break
         if ekey(h, nxt) in walls:
             break
+        gate_i = gates.get(ekey(h, nxt))
+        if gate_i is not None and not (open_gates & (1 << gate_i)):
+            open_gates |= 1 << gate_i
+            return True, t, h, m, open_gates
         if nxt in occ:
             break
         t, h = h, nxt
         moved += 1
-    return moved, t, h
+        if h in redirects:
+            m = redirects[h]
+    return moved > 0, t, h, m, open_gates
 
 
-def q_moves(pen_set, walls, queues, state):
+def q_moves(pen_set, walls, queues, state, redirects=None, gate_edges=None):
     """枚举当前状态的所有合法移动,返回 [(新状态)]。
     state = (entered, counts):entered = ((t,h,m), ...) 排序元组。"""
-    entered, counts = state
+    if len(state) == 2:  # 兼容无机制旧调用
+        entered, counts = state
+        open_gates = 0
+    else:
+        entered, counts, open_gates = state
+    redirects = redirects or {}
+    gate_edges = gate_edges or []
+    gates = {edge: i for i, edge in enumerate(gate_edges)}
     occ = set()
     for t, h, m in entered:
         occ.add(t)
@@ -127,34 +147,36 @@ def q_moves(pen_set, walls, queues, state):
         if h0 in occ or t0 in occ:
             continue
         m = neg(d)
-        moved, t, h = _slide(pen_set, walls, occ, t0, h0, m)
-        if moved == 0:
+        acted, t, h, m, ng = _slide(
+            pen_set, walls, occ, t0, h0, m, redirects, gates, open_gates)
+        if not acted:
             continue
         ne = tuple(sorted(entered + ((t, h, m),)))
         nc = counts[:qi] + (counts[qi] - 1,) + counts[qi + 1:]
-        results.append((ne, nc))
+        results.append((ne, nc, ng))
 
     # 2. 已入场的猪再滑
     for i, (t, h, m) in enumerate(entered):
         occ2 = occ - {t, h}
-        moved, nt, nh = _slide(pen_set, walls, occ2, t, h, m)
-        if moved == 0:
+        acted, nt, nh, nm, ng = _slide(
+            pen_set, walls, occ2, t, h, m, redirects, gates, open_gates)
+        if not acted:
             continue
-        ne = tuple(sorted(entered[:i] + entered[i + 1:] + ((nt, nh, m),)))
-        results.append((ne, counts))
+        ne = tuple(sorted(entered[:i] + entered[i + 1:] + ((nt, nh, nm),)))
+        results.append((ne, counts, ng))
     return results
 
 
 def q_won(pen_set, state):
-    entered, counts = state
+    entered, counts = state[:2]
     if any(counts):
         return False
     return all(t in pen_set and h in pen_set for t, h, m in entered)
 
 
-def solve(pen_set, walls, queues, max_depth=60):
+def solve(pen_set, walls, queues, max_depth=60, redirects=None, gate_edges=None):
     """BFS 最短解;返回 最优步数 或 None。"""
-    init = ((), tuple(q[2] for q in queues))
+    init = ((), tuple(q[2] for q in queues), 0)
     seen = {init}
     q = deque([(init, 0)])
     while q:
@@ -165,7 +187,7 @@ def solve(pen_set, walls, queues, max_depth=60):
             continue
         if len(seen) > BFS_NODE_CAP:
             return None
-        for ns in q_moves(pen_set, walls, queues, state):
+        for ns in q_moves(pen_set, walls, queues, state, redirects, gate_edges):
             if ns not in seen:
                 seen.add(ns)
                 q.append((ns, depth + 1))
@@ -178,17 +200,17 @@ class TooLarge(Exception):
     pass
 
 
-def analyze(pen_set, walls, queues, budget):
+def analyze(pen_set, walls, queues, budget, redirects=None, gate_edges=None):
     """返回 {p_win, n_paths, crit, decep} 或 None(预算内不可解);
     状态数超过 DP_STATE_CAP 抛 TooLarge。"""
-    init = ((), tuple(q[2] for q in queues))
+    init = ((), tuple(q[2] for q in queues), 0)
 
     moves_memo = {}
 
     def moves(state):
         r = moves_memo.get(state)
         if r is None:
-            r = q_moves(pen_set, walls, queues, state)
+            r = q_moves(pen_set, walls, queues, state, redirects, gate_edges)
             moves_memo[state] = r
             if len(moves_memo) > DP_STATE_CAP:
                 raise TooLarge()
@@ -300,8 +322,10 @@ def _xform(c, k):
     return (-y, -x)         # 副对角镜像
 
 
-def canon_sig(pen_set, queues):
+def canon_sig(pen_set, queues, redirects=None, gate_edges=None):
     """D4 八变换下的规范签名:任意两关(含彼此的旋转/镜像)都不同。"""
+    redirects = redirects or {}
+    gate_edges = gate_edges or []
     best = None
     for k in range(8):
         pen = [_xform(c, k) for c in pen_set]
@@ -311,7 +335,15 @@ def canon_sig(pen_set, queues):
         pen_n = tuple(sorted((x - mx, y - my) for x, y in pen))
         qs_n = tuple(sorted(((c[0] - mx, c[1] - my),
                              (o[0] - mx, o[1] - my), n) for c, o, n in qs))
-        sig = (pen_n, qs_n)
+        rs_n = tuple(sorted(((_xform(c, k)[0] - mx, _xform(c, k)[1] - my),
+                             _xform(d, k)) for c, d in redirects.items()))
+        gs_n = []
+        for a, b in gate_edges:
+            ta, tb = _xform(a, k), _xform(b, k)
+            edge = tuple(sorted(((ta[0] - mx, ta[1] - my),
+                                 (tb[0] - mx, tb[1] - my))))
+            gs_n.append(edge)
+        sig = (pen_n, qs_n, rs_n, tuple(sorted(gs_n)))
         if best is None or sig < best:
             best = sig
     return best
@@ -863,13 +895,28 @@ def main():
             f"{min(a['n_paths'], 99999999):8d} "
             f"{difficulty(cand, sl):5.2f}  {cand['pen_w']}x{cand['pen_h']}")
 
+    # Add the authored Redirect teaching arc after the reproducible base set.
+    from mechanize_levels import apply_mechanics, build_report
+    levels_json = apply_mechanics(levels_json)
+    # Rebuild every over-similar endpoint, then sort the final playable data by
+    # the exact difficulty score (not merely by pig count).
+    from rebuild_similar_levels import (SEED as REBUILD_SEED, rebuild,
+                                        sort_by_difficulty)
+    levels_json, _, _ = rebuild(levels_json, random.Random(REBUILD_SEED))
+    levels_json, _ = sort_by_difficulty(levels_json)
+    # Strictly expand the curated seed set. The expansion performs online
+    # similarity rejection and a second exact sort over all 1000 levels.
+    from expand_to_1000 import expand
+    levels_json, _ = expand(levels_json)
+    report = build_report(levels_json).rstrip().splitlines()
+
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, 'levels.json'), 'w') as f:
         json.dump(levels_json, f, indent=1)
     with open(os.path.join(root, 'tools', 'levels_report.txt'), 'w') as f:
         f.write("\n".join(report) + "\n")
     print("\n".join(report[:14]))
-    print("……(共 100 关)已写入 levels.json 与 tools/levels_report.txt")
+    print(f"……(共 {len(levels_json)} 关)已写入 levels.json 与 tools/levels_report.txt")
 
 
 if __name__ == '__main__':

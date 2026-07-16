@@ -1,0 +1,17 @@
+{
+  "seed": 20260718,
+  "levels": 1000,
+  "total_redirects": 932,
+  "total_gates": 0,
+  "multi_redirect_levels": 450,
+  "triple_redirect_levels": 198,
+  "late_range": [
+    701,
+    1000
+  ],
+  "late_redirects": 300,
+  "difficulty_min": 5.461,
+  "difficulty_l701": 34.885,
+  "difficulty_max": 44.565,
+  "high_similarity_pairs": 0
+}
