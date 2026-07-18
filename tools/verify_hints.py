@@ -16,7 +16,7 @@ from generate_levels import build_walls, q_moves, q_won
 
 def shortest_state_path(level):
     walls = build_walls(level['pen'], [(c, d) for c, d, _ in level['queues']])
-    initial = ((), tuple(q[2] for q in level['queues']), 0)
+    initial = ((), tuple(len(q[2]) for q in level['queues']), 0)
     queue = deque([initial])
     parent = {initial: None}
     won = None
@@ -40,30 +40,39 @@ def shortest_state_path(level):
     return path, walls
 
 
+def _verify_hint_level(item):
+    """单关提示审计(并行 worker):返回 (检查状态数, 是否多箭头) 或抛错。"""
+    index, level = item
+    path, walls = shortest_state_path(level)
+    if len(path) - 1 != level['min']:
+        raise AssertionError(
+            f'L{index + 1:04d}: hint path {len(path)-1} != min {level["min"]}')
+    checked = 0
+    for step, (state, hinted) in enumerate(zip(path, path[1:])):
+        legal = q_moves(level['pen'], walls, level['queues'], state,
+                        level['redirects'], [], level.get('muds'))
+        if hinted not in legal:
+            raise AssertionError(
+                f'L{index + 1:04d} step {step}: hint is not legal')
+        remaining = level['steps'] - step
+        if len(path) - step - 1 > remaining:
+            raise AssertionError(
+                f'L{index + 1:04d} step {step}: hint exceeds budget')
+        checked += 1
+    if not q_won(level['pen'], path[-1]):
+        raise AssertionError(f'L{index + 1:04d}: hint suffix does not win')
+    return checked, len(level['redirects']) >= 2
+
+
 def main():
     levels = load_levels()
-    checked_states = 0
-    multi_levels = 0
-    for index, level in enumerate(levels):
-        path, walls = shortest_state_path(level)
-        if len(path) - 1 != level['min']:
-            raise AssertionError(
-                f'L{index + 1:04d}: hint path {len(path)-1} != min {level["min"]}')
-        if len(level['redirects']) >= 2:
-            multi_levels += 1
-        for step, (state, hinted) in enumerate(zip(path, path[1:])):
-            legal = q_moves(level['pen'], walls, level['queues'], state,
-                            level['redirects'], [], level.get('muds'))
-            if hinted not in legal:
-                raise AssertionError(
-                    f'L{index + 1:04d} step {step}: hint is not legal')
-            remaining = level['steps'] - step
-            if len(path) - step - 1 > remaining:
-                raise AssertionError(
-                    f'L{index + 1:04d} step {step}: hint exceeds budget')
-            checked_states += 1
-        if not q_won(level['pen'], path[-1]):
-            raise AssertionError(f'L{index + 1:04d}: hint suffix does not win')
+    import multiprocessing as mp
+    with mp.get_context('fork').Pool(
+            max(2, min(8, mp.cpu_count() - 1))) as pool:
+        results = pool.map(_verify_hint_level, list(enumerate(levels)),
+                           chunksize=4)
+    checked_states = sum(c for c, _ in results)
+    multi_levels = sum(1 for _, m in results if m)
     result = (f'ALL {len(levels)} LEVEL HINTS OK; '
               f'path_states={checked_states}; multi_redirect_levels={multi_levels}')
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

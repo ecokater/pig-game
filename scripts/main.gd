@@ -18,7 +18,6 @@ const PigScript := preload("res://scripts/pig.gd")
 const BearScript := preload("res://scripts/bear.gd")
 const PenRendererScript := preload("res://scripts/pen_renderer.gd")
 
-const PIG_TEX := preload("res://art/pig.svg")
 const BEAR_TEX := preload("res://art/bear.svg")
 const CLOUD_TEX := preload("res://art/cloud.svg")
 const CROSS_TEX := preload("res://art/cross.svg")
@@ -133,10 +132,18 @@ static func _load_levels_from_json() -> Array:
 		var lv: Dictionary = lv_raw
 		var parsed_queues: Array = []
 		for q in lv["queues"]:
+			# 第三项:int(旧格式,全 2 格猪)或体长序列(如 [3,2,1],队首在前)
+			var lens: Array = []
+			if q[2] is Array:
+				for x in q[2]:
+					lens.append(int(x))
+			else:
+				for _k in int(q[2]):
+					lens.append(2)
 			parsed_queues.append({
 				"cell": Vector2i(int(q[0][0]), int(q[0][1])),
 				"dir": Vector2i(int(q[1][0]), int(q[1][1])),
-				"count": int(q[2]),
+				"lens": lens,
 			})
 		var parsed_redirects: Array = []
 		for r in lv.get("redirects", []):
@@ -199,10 +206,12 @@ func _ready() -> void:
 
 # ---------- 关卡装载 ----------
 
-func _ray_cells(c: Vector2i, d: Vector2i, count: int) -> Array:
-	## 开口在圈外需要的净空格:可见槽位 + 徽章格(与生成器一致)
-	var need := 2 * mini(VISIBLE_PIGS, count)
-	if count > VISIBLE_PIGS:
+func _ray_cells(c: Vector2i, d: Vector2i, lens: Array) -> Array:
+	## 开口在圈外需要的净空格:可见槽位(按队首两头猪体长)+ 徽章格
+	var need := 0
+	for k in mini(VISIBLE_PIGS, lens.size()):
+		need += int(lens[k])
+	if lens.size() > VISIBLE_PIGS:
 		need += 1
 	var cells: Array = []
 	for k in range(1, need + 1):
@@ -238,7 +247,7 @@ func _load_level(lv: Dictionary) -> void:
 	var maxc := Vector2i(-99, -99)
 	var all_cells: Array = pen_cells.duplicate()
 	for q in queues:
-		all_cells.append_array(_ray_cells(q["cell"], q["dir"], q["count"]))
+		all_cells.append_array(_ray_cells(q["cell"], q["dir"], q["lens"]))
 	for c in all_cells:
 		minc = Vector2i(mini(minc.x, c.x), mini(minc.y, c.y))
 		maxc = Vector2i(maxi(maxc.x, c.x), maxi(maxc.y, c.y))
@@ -281,20 +290,18 @@ func _spawn_pigs() -> void:
 		var q: Dictionary = queues[qi]
 		var c: Vector2i = q["cell"]
 		var d: Vector2i = q["dir"]
+		var lens: Array = q["lens"]
 		var lane: Array = []
-		for k in q["count"]:
+		var offset := 1
+		for k in lens.size():
+			var body: Array = []
+			for j in int(lens[k]):
+				body.append(c + d * (offset + j))
+			offset += int(lens[k])
 			var pig: Node2D = PigScript.new()
-			pig.main = self
-			pig.head = c + d * (1 + 2 * k)
-			pig.tail = c + d * (2 + 2 * k)
-			pig.dir = -d
+			pig.setup(self, body, -d, Meta.skin_tint())
 			pig.entered = false
 			pig.qi = qi
-			var spr := Sprite2D.new()
-			spr.name = "Sprite"
-			spr.texture = PIG_TEX
-			spr.modulate = Meta.skin_tint()
-			pig.add_child(spr)
 			pig.visible = k < VISIBLE_PIGS
 			add_child(pig)
 			pigs.append(pig)
@@ -311,7 +318,10 @@ func _spawn_pigs() -> void:
 		badge.add_theme_color_override("font_outline_color", Color(1, 1, 1, 0.9))
 		badge.add_theme_constant_override("outline_size", int(cell_size * 0.08))
 		badge.size = Vector2(cell_size * 2.0, cell_size)
-		var bc: Vector2i = c + d * (2 * VISIBLE_PIGS + 1)
+		var vis_cells := 0
+		for k in mini(VISIBLE_PIGS, lens.size()):
+			vis_cells += int(lens[k])
+		var bc: Vector2i = c + d * (vis_cells + 1)
 		badge.position = cell_center(bc) - badge.size / 2.0
 		add_child(badge)
 		badges.append(badge)
@@ -333,34 +343,39 @@ func _rebuild_occupied() -> void:
 	occupied.clear()
 	for pig in pigs:
 		if pig.entered or pig.visible:
-			occupied[pig.tail] = pig
-			occupied[pig.head] = pig
+			for cc in pig.cells:
+				occupied[cc] = pig
 
 
 func _relayout_queues(animate: bool) -> void:
 	## 队列补位:进圈猪让出位置后,等待猪贴着开口重排;
-	## 跨在开口上的猪(尾巴占住第一格)会把整队向外顶一格。
+	## 跨在开口上的猪(身体还占着圈外格)会把整队向外顶。
 	for qi in queues.size():
 		var q: Dictionary = queues[qi]
 		var c: Vector2i = q["cell"]
 		var d: Vector2i = q["dir"]
 		var base := 1
-		var first := c + d
-		if occupied.has(first) and occupied[first].entered:
-			base = 2
+		while true:
+			var probe: Vector2i = c + d * base
+			if occupied.has(probe) and occupied[probe].entered:
+				base += 1
+			else:
+				break
 		var waiting := _waiting_list(qi)
+		var offset := base
 		for k in waiting.size():
 			var pig: Node2D = waiting[k]
-			pig.head = c + d * (base + 2 * k)
-			pig.tail = c + d * (base + 2 * k + 1)
+			var body: Array = []
+			for j in pig.length():
+				body.append(c + d * (offset + j))
+			offset += pig.length()
+			pig.cells = body
 			var was_hidden: bool = not pig.visible
 			pig.visible = k < VISIBLE_PIGS
 			if pig.visible and not was_hidden and animate:
-				var tw := create_tween()
-				tw.tween_property(pig, "position", pig.center_pos(), 0.15)\
-					.set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+				pig.tween_pose(0.15)
 			else:
-				pig.position = pig.center_pos()
+				pig.sync_pose()
 	_rebuild_occupied()
 	_update_badges()
 
@@ -385,7 +400,7 @@ func _spawn_bear() -> void:
 	for cand in corners:
 		var clear := true
 		for pig in pigs:
-			if pig.visible and pig.hit_rect().grow(70.0).has_point(cand):
+			if pig.visible and pig.bounds_rect().grow(70.0).has_point(cand):
 				clear = false
 				break
 		if clear and not _pen_rect().grow(70.0).has_point(cand):
@@ -427,42 +442,49 @@ func _unhandled_input(event: InputEvent) -> void:
 			and event.button_index == MOUSE_BUTTON_LEFT:
 		var p := get_global_mouse_position()
 		for pig in pigs:
-			if pig.visible and pig.hit_rect().has_point(p):
+			if pig.visible and pig.hit_test(p):
 				_tap_pig(pig)
 				return
 
 
 func _tap_pig(pig: Node2D) -> void:
-	# 移动前快照,供撤销道具回滚
+	# 移动前快照:供撤销道具回滚,也用于滑行超限(箭头走马灯)时原地还原
 	var snap := {"steps": steps_left, "moves": moves_made, "pigs": []}
 	for pg in pigs:
-		snap["pigs"].append([pg, pg.tail, pg.head, pg.dir, pg.entered])
+		snap["pigs"].append([pg, pg.cells.duplicate(), pg.dir, pg.entered])
 
 	var moved := 0
-	var acted := false
-	var path: Array = []
-	while moved < 64:
-		var next: Vector2i = pig.head + pig.dir
-		if is_inside(pig.head) and not is_inside(next):
+	var snaps: Array = []
+	while true:
+		if moved >= 90:
+			# 箭头走马灯:视为非法移动(与生成器内核一致),原地还原
+			_restore_snapshot(snap)
+			pig.wiggle()
+			return
+		var head: Vector2i = pig.cells[0]
+		var next: Vector2i = head + pig.dir
+		if is_inside(head) and not is_inside(next):
 			break  # 开口只进不出
-		if walls.has(_edge_key(pig.head, next)):
+		if walls.has(_edge_key(head, next)):
 			break
 		if occupied.has(next):
-			break
-		occupied.erase(pig.tail)
-		pig.tail = pig.head
-		pig.head = next
+			var other: Node2D = occupied[next]
+			if other != pig:
+				break
+			if next != pig.tail_cell():
+				break  # 自撞身体中段;正在腾出的尾格可以进
+		occupied.erase(pig.tail_cell())
+		pig.cells.pop_back()
+		pig.cells.push_front(next)
 		occupied[next] = pig
 		moved += 1
-		acted = true
-		if redirects.has(pig.head):
-			pig.dir = redirects[pig.head]
-		# 两格身体沿折线路径跟随；转弯第一格仍按头尾连线显示朝向。
-		path.append([pig.center_pos(), pig.head - pig.tail])
-		if muds.has(pig.head):
+		if redirects.has(next):
+			pig.dir = redirects[next]
+		snaps.append([pig.cells.duplicate(), pig.dir])
+		if muds.has(next):
 			break  # 泥坑:当场停下,再点一次才继续走
 
-	if not acted:
+	if moved == 0:
 		pig.wiggle()
 		return
 	_preview_pig = null
@@ -476,8 +498,7 @@ func _tap_pig(pig: Node2D) -> void:
 	moves_made += 1
 	_update_steps_label()
 	animating = true
-	if moved > 0:
-		await pig.slide_path(path, 0.12 + 0.05 * moved)
+	await pig.slide_snapshots(snaps, 0.12 + 0.05 * moved)
 	animating = false
 	_relayout_queues(true)
 	_check_state()
@@ -485,10 +506,27 @@ func _tap_pig(pig: Node2D) -> void:
 		_update_doom()
 
 
+func _restore_snapshot(snap: Dictionary) -> void:
+	for e in snap["pigs"]:
+		var pg: Node2D = e[0]
+		pg.cells = (e[1] as Array).duplicate()
+		pg.dir = e[2]
+		pg.entered = e[3]
+	steps_left = snap["steps"]
+	moves_made = snap["moves"]
+	_rebuild_occupied()
+	_relayout_queues(false)
+	for pg in pigs:
+		if pg.entered:
+			pg.sync_pose()
+	_update_steps_label()
+
+
 func _all_inside() -> bool:
 	for pig in pigs:
-		if not (is_inside(pig.tail) and is_inside(pig.head)):
-			return false
+		for cc in pig.cells:
+			if not is_inside(cc):
+				return false
 	return true
 
 
@@ -497,11 +535,17 @@ func _any_move_possible() -> bool:
 	for pig in pigs:
 		if not pig.visible:
 			continue
-		var next: Vector2i = pig.head + pig.dir
-		if is_inside(pig.head) and not is_inside(next):
+		var head: Vector2i = pig.cells[0]
+		var next: Vector2i = head + pig.dir
+		if is_inside(head) and not is_inside(next):
 			continue
-		if not walls.has(_edge_key(pig.head, next)) and not occupied.has(next):
-			return true
+		if walls.has(_edge_key(head, next)):
+			continue
+		if occupied.has(next):
+			var other: Node2D = occupied[next]
+			if other != pig or next != pig.tail_cell():
+				continue
+		return true
 	return false
 
 
@@ -551,7 +595,7 @@ func _update_preview() -> void:
 	var p := get_global_mouse_position()
 	var hover: Node2D = null
 	for pig in pigs:
-		if pig.visible and pig.hit_rect().has_point(p):
+		if pig.visible and pig.hit_test(p):
 			hover = pig
 			break
 	if hover == _preview_pig:
@@ -560,31 +604,33 @@ func _update_preview() -> void:
 	_preview_cells.clear()
 	_preview_end.clear()
 	if hover != null:
-		var t: Vector2i = hover.tail
-		var h: Vector2i = hover.head
-		var m: Vector2i = hover.dir
 		var occ := occupied.duplicate()
-		occ.erase(t)
-		occ.erase(h)
+		for cc in hover.cells:
+			occ.erase(cc)
+		var cells: Array = hover.cells.duplicate()
+		var m: Vector2i = hover.dir
 		var moved := 0
-		while moved < 64:
-			var next: Vector2i = h + m
-			if is_inside(h) and not is_inside(next):
+		while moved < 90:
+			var head: Vector2i = cells[0]
+			var next: Vector2i = head + m
+			if is_inside(head) and not is_inside(next):
 				break
-			if walls.has(_edge_key(h, next)):
+			if walls.has(_edge_key(head, next)):
 				break
 			if occ.has(next):
 				break
-			t = h
-			h = next
+			if cells.has(next) and next != cells[cells.size() - 1]:
+				break
+			cells.pop_back()
+			cells.push_front(next)
 			moved += 1
-			_preview_cells.append(h)
-			if redirects.has(h):
-				m = redirects[h]
-			if muds.has(h):
+			_preview_cells.append(next)
+			if redirects.has(next):
+				m = redirects[next]
+			if muds.has(next):
 				break
 		if moved > 0:
-			_preview_end = [t, h]
+			_preview_end = cells
 	_overlay.queue_redraw()
 
 
@@ -599,12 +645,11 @@ class PreviewOverlay extends Node2D:
 		var cell: float = main.cell_size
 		for c in main._preview_cells:
 			draw_circle(main.cell_center(c), cell * 0.07, Color(1, 1, 1, 0.55))
-		var pt: Vector2i = main._preview_end[0]
-		var ph: Vector2i = main._preview_end[1]
-		for c2 in [pt, ph]:
+		for c2 in main._preview_end:
 			var pos: Vector2 = main.grid_origin + Vector2(c2) * cell
 			draw_rect(Rect2(pos + Vector2(7, 7) , Vector2(cell - 14, cell - 14)),
 					Color(1, 1, 1, 0.24))
+		var ph: Vector2i = main._preview_end[0]
 		var hp: Vector2 = main.grid_origin + Vector2(ph) * cell
 		draw_rect(Rect2(hp + Vector2(7, 7), Vector2(cell - 14, cell - 14)),
 				Color(1, 1, 1, 0.9), false, 4.0)
@@ -619,23 +664,9 @@ func _do_undo() -> void:
 		_toast("金币不足")
 		return
 	var snap: Dictionary = _undo_stack.pop_back()
-	for e in snap["pigs"]:
-		var pg: Node2D = e[0]
-		pg.tail = e[1]
-		pg.head = e[2]
-		pg.dir = e[3]
-		pg.entered = e[4]
-		pg.rotation = Vector2(pg.head - pg.tail).angle() + PI / 2.0
-	steps_left = snap["steps"]
-	moves_made = snap["moves"]
-	_rebuild_occupied()
-	_relayout_queues(false)
-	for pg in pigs:
-		if pg.entered:
-			pg.position = pg.center_pos()
+	_restore_snapshot(snap)
 	_preview_pig = null
 	_overlay.queue_redraw()
-	_update_steps_label()
 	_refresh_topbar()
 	_refresh_boosters()
 	_update_doom()
@@ -661,7 +692,7 @@ func _do_hint() -> void:
 			waiting[0].flash()
 	else:
 		for pig in pigs:
-			if pig.entered and pig.tail == mv[1] and pig.head == mv[2]:
+			if pig.entered and pig.cells == mv[1]:
 				pig.flash()
 				break
 	_refresh_topbar()
@@ -690,7 +721,7 @@ func _solve_from_current(node_budget: int = HINT_BUDGET) -> Variant:
 	var counts: Array = []
 	for pig in pigs:
 		if pig.entered:
-			entered.append([pig.tail, pig.head, pig.dir])
+			entered.append([pig.cells.duplicate(), pig.dir])
 	for qi in queues.size():
 		counts.append(_waiting_list(qi).size())
 	entered.sort()
@@ -701,32 +732,41 @@ func _solve_from_current(node_budget: int = HINT_BUDGET) -> Variant:
 	return _dfs(entered, counts, steps_left, visited)
 
 
-func _sim_slide(t: Vector2i, h: Vector2i, m: Vector2i, occ: Dictionary) -> Array:
+func _sim_slide(cells_in: Array, m: Vector2i, occ: Dictionary) -> Array:
+	var cells: Array = cells_in.duplicate()
 	var moved := 0
-	while moved < 64:
-		var next: Vector2i = h + m
-		if is_inside(h) and not is_inside(next):
+	while true:
+		if moved >= 90:
+			return [false, cells, m]
+		var head: Vector2i = cells[0]
+		var next: Vector2i = head + m
+		if is_inside(head) and not is_inside(next):
 			break
-		if walls.has(_edge_key(h, next)):
+		if walls.has(_edge_key(head, next)):
 			break
 		if occ.has(next):
 			break
-		t = h
-		h = next
-		moved += 1
-		if redirects.has(h):
-			m = redirects[h]
-		if muds.has(h):
+		if cells.has(next) and next != cells[cells.size() - 1]:
 			break
-	return [moved > 0, t, h, m]
+		cells.pop_back()
+		cells.push_front(next)
+		moved += 1
+		if redirects.has(next):
+			m = redirects[next]
+		if muds.has(next):
+			break
+	return [moved > 0, cells, m]
 
 
 func _dfs(entered: Array, counts: Array, remaining: int,
 		visited: Dictionary) -> Variant:
 	var done := true
 	for p in entered:
-		if not (is_inside(p[0]) and is_inside(p[1])):
-			done = false
+		for cc in p[0]:
+			if not is_inside(cc):
+				done = false
+				break
+		if not done:
 			break
 	if done:
 		for c in counts:
@@ -748,24 +788,33 @@ func _dfs(entered: Array, counts: Array, remaining: int,
 
 	var occ := {}
 	for p in entered:
-		occ[p[0]] = true
-		occ[p[1]] = true
+		for cc in p[0]:
+			occ[cc] = true
 
-	# 释放某队队首
+	# 释放某队队首(体长取自真实队列的对应位置)
 	for qi in counts.size():
 		if counts[qi] == 0:
 			continue
+		var waiting := _waiting_list(qi)
+		var next_pig: Node2D = waiting[waiting.size() - counts[qi]]
+		var length: int = next_pig.length()
 		var c: Vector2i = queues[qi]["cell"]
 		var d: Vector2i = queues[qi]["dir"]
-		var h0: Vector2i = c + d
-		var t0: Vector2i = c + d * 2
-		if occ.has(h0) or occ.has(t0):
+		var spawn: Array = []
+		var blocked := false
+		for j in length:
+			var cellj: Vector2i = c + d * (1 + j)
+			if occ.has(cellj):
+				blocked = true
+				break
+			spawn.append(cellj)
+		if blocked:
 			continue
-		var r := _sim_slide(t0, h0, -d, occ)
+		var r := _sim_slide(spawn, -d, occ)
 		if not r[0]:
 			continue
 		var ne := entered.duplicate(true)
-		ne.append([r[1], r[2], r[3]])
+		ne.append([r[1], r[2]])
 		ne.sort()
 		var nc := counts.duplicate()
 		nc[qi] -= 1
@@ -779,18 +828,18 @@ func _dfs(entered: Array, counts: Array, remaining: int,
 	for i in entered.size():
 		var p: Array = entered[i]
 		var occ2 := occ.duplicate()
-		occ2.erase(p[0])
-		occ2.erase(p[1])
-		var r := _sim_slide(p[0], p[1], p[2], occ2)
+		for cc in p[0]:
+			occ2.erase(cc)
+		var r := _sim_slide(p[0], p[1], occ2)
 		if not r[0]:
 			continue
 		var ne := entered.duplicate(true)
-		ne[i] = [r[1], r[2], r[3]]
+		ne[i] = [r[1], r[2]]
 		ne.sort()
 		var sub = _dfs(ne, counts, remaining - 1, visited)
 		if sub != null:
 			var path: Array = sub
-			path.insert(0, ["p", p[0], p[1]])
+			path.insert(0, ["p", p[0]])
 			return path
 	return null
 
@@ -798,8 +847,9 @@ func _dfs(entered: Array, counts: Array, remaining: int,
 func _state_key(entered: Array, counts: Array) -> String:
 	var s := ""
 	for p in entered:
-		s += "%d,%d,%d,%d,%d,%d;" % [p[0].x, p[0].y, p[1].x, p[1].y,
-			p[2].x, p[2].y]
+		for cc in p[0]:
+			s += "%d,%d." % [cc.x, cc.y]
+		s += "%d,%d;" % [p[1].x, p[1].y]
 	s += "|"
 	for c in counts:
 		s += "%d," % c
@@ -812,9 +862,7 @@ func _win() -> void:
 	game_over = true
 	_title.text = "全部进圈！"
 	for pig in pigs:
-		var tw := create_tween().set_loops(3)
-		tw.tween_property(pig, "scale", Vector2(1.12, 1.12), 0.15)
-		tw.tween_property(pig, "scale", Vector2.ONE, 0.15)
+		pig.celebrate()
 
 	# 星级:最优步数 3★,多 1 步 2★,过关 1★
 	var star_cnt := 1
@@ -871,21 +919,27 @@ func _do_fail() -> void:
 	_title.text = "糟糕…"
 	var victim: Node2D = null
 	for pig in pigs:
-		if pig.visible and not (is_inside(pig.tail) and is_inside(pig.head)):
-			victim = pig
+		if not pig.visible:
+			continue
+		for cc in pig.cells:
+			if not is_inside(cc):
+				victim = pig
+				break
+		if victim != null:
 			break
 	if victim != null and bear != null:
 		bear.chasing = true
+		var target: Vector2 = victim.center_pos()
 		var tw := create_tween()
 		tw.tween_property(bear, "rotation",
-				(victim.position - bear.position).angle() + PI / 2.0, 0.15)
-		tw.tween_property(bear, "position", victim.position, 0.7)\
+				(target - bear.position).angle() + PI / 2.0, 0.15)
+		tw.tween_property(bear, "position", target, 0.7)\
 			.set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
 		await tw.finished
 		victim.visible = false
 		bear.visible = false
-		_spawn_cloud(victim.position)
-		_spawn_cross(victim.position + Vector2(140, -60))
+		_spawn_cloud(target)
+		_spawn_cross(target + Vector2(140, -60))
 		await get_tree().create_timer(1.4).timeout
 	_btn_mode = "retry"
 	_result_label.text = "小猪被熊抓走了…"
@@ -1339,7 +1393,7 @@ func _populate_shop() -> void:
 
 func _apply_skin() -> void:
 	for pig in pigs:
-		pig.get_node("Sprite").modulate = Meta.skin_tint()
+		pig.set_tint(Meta.skin_tint())
 
 
 func _toggle_select() -> void:

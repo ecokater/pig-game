@@ -8,7 +8,7 @@ import json
 import os
 
 from generate_levels import (DIRS, add, analyze, build_walls, canon_sig,
-                             ray_cells, solve)
+                             norm_lens, ray_cells, solve)
 
 
 ARROW_PUZZLES = [
@@ -127,10 +127,11 @@ def build_report(levels):
         assert metrics is not None
         xs, ys = [c[0] for c in pen], [c[1] for c in pen]
         width, height = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+        q_lens = [norm_lens(q[2]) for q in queues]
         lines.append(
-            f"L{i + 1:03d} {sum(q[2] for q in queues):4d} "
+            f"L{i + 1:03d} {sum(len(l) for l in q_lens):4d} "
             f"{level['min']:3d} {level['steps']:3d} "
-            f"{max(q[2] for q in queues):2d} {len(queues):2d} "
+            f"{max(len(l) for l in q_lens):2d} {len(queues):2d} "
             f"{len(redirects):2d} {len(gates):2d} "
             f"{metrics['p_win'] * 100:6.2f} {metrics['crit']:4d} "
             f"{metrics['decep']:3d} "

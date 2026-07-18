@@ -27,7 +27,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from evaluate_levels import (difficulty, evaluate, report, shortest_method,
                              load_levels as _unused_load)
-from generate_levels import TooLarge, analyze, build_walls, canon_sig, solve
+from generate_levels import (TooLarge, analyze, build_walls, canon_sig,
+                             norm_lens, solve)
 from rebuild_similar_levels import is_high_similarity, parse
 
 SEED = 20260721
@@ -39,17 +40,19 @@ TRIES_PER_LEVEL = 80
 def write_reports(root, rows, pairs):
     with open(os.path.join(root, 'tools', 'levels_evaluation_after.md'), 'w') as f:
         f.write(report(rows, pairs))
-    lines = ['#    pigs min bud qu op rd md  p_win  crit dcp    paths  difficulty',
-             '-' * 80]
+    lines = ['#    pigs min bud qu op rd md mx  p_win  crit dcp    paths  difficulty',
+             '-' * 83]
     for row in rows:
         level, metrics = row['level'], row['metrics']
+        lens = [norm_lens(q[2]) for q in level['queues']]
         lines.append(
             f"L{row['index'] + 1:04d} "
-            f"{sum(q[2] for q in level['queues']):4d} "
+            f"{sum(len(l) for l in lens):4d} "
             f"{level['min']:3d} {level['steps']:3d} "
-            f"{max(q[2] for q in level['queues']):2d} "
+            f"{max(len(l) for l in lens):2d} "
             f"{len(level['queues']):2d} {len(level['redirects']):2d} "
             f"{len(level.get('muds') or ()):2d} "
+            f"{sum(1 for l in lens for x in l if x != 2):2d} "
             f"{metrics['p_win'] * 100:6.2f} {metrics['crit']:4d} "
             f"{metrics['decep']:3d} "
             f"{min(metrics['n_paths'], 99999999):8d} "

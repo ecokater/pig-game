@@ -92,19 +92,32 @@ def build_walls(pen_set, openings):
     return walls
 
 
-def _slide(pen_set, walls, occ, t, h, m, redirects=None, gates=None,
-           open_gates=0, muds=None):
-    """从 (t,h) 沿 m 滑到底。
+def norm_lens(q2):
+    """队列第三项归一化:int(旧格式,全为 2 格猪)→ 长度元组;列表原样转元组。"""
+    if isinstance(q2, int):
+        return (2,) * q2
+    return tuple(int(x) for x in q2)
 
-    箭头在猪头进入格子后立即改向；泥坑让猪头当场停下(再点一次可继续走);
-    关闭门被撞开但本次停在门前。
-    返回 (是否产生操作, t, h, 最终方向, 已开门位图)。
+
+def _slide(pen_set, walls, occ, cells, m, redirects=None, gates=None,
+           open_gates=0, muds=None):
+    """猪身 = 有序格元组(头在前),沿 m 蛇形滑到底,身体跟着头的路径弯曲。
+
+    箭头在猪头进入格子后立即改向;泥坑让猪头当场停下(再点一次可继续走);
+    关闭门被撞开但本次停在门前。头可以进"本步正要腾出的尾格"(原地掉头),
+    不可进身体中段。
+    返回 (是否产生操作, cells, 最终方向, 已开门位图)。
     """
     redirects = redirects or {}
     gates = gates or {}
     muds = muds or ()
+    cells = list(cells)
     moved = 0
-    while moved < 100:
+    while True:
+        if moved >= 90:
+            # 箭头走马灯:视为非法移动(与游戏运行时一致)
+            return False, tuple(cells), m, open_gates
+        h = cells[0]
         nxt = add(h, m)
         if h in pen_set and nxt not in pen_set:
             break
@@ -113,22 +126,25 @@ def _slide(pen_set, walls, occ, t, h, m, redirects=None, gates=None,
         gate_i = gates.get(ekey(h, nxt))
         if gate_i is not None and not (open_gates & (1 << gate_i)):
             open_gates |= 1 << gate_i
-            return True, t, h, m, open_gates
+            return True, tuple(cells), m, open_gates
         if nxt in occ:
             break
-        t, h = h, nxt
+        if nxt in cells and nxt != cells[-1]:
+            break  # 自撞:只允许进正在腾出的尾格
+        cells = [nxt] + cells[:-1]
         moved += 1
-        if h in redirects:
-            m = redirects[h]
-        if h in muds:
+        if nxt in redirects:
+            m = redirects[nxt]
+        if nxt in muds:
             break
-    return moved > 0, t, h, m, open_gates
+    return moved > 0, tuple(cells), m, open_gates
 
 
 def q_moves(pen_set, walls, queues, state, redirects=None, gate_edges=None,
             muds=None):
     """枚举当前状态的所有合法移动,返回 [(新状态)]。
-    state = (entered, counts):entered = ((t,h,m), ...) 排序元组。"""
+    state = (entered, counts):entered = ((cells, m), ...) 排序元组,
+    cells 为猪身格元组(头在前,长度 1/2/3)。"""
     if len(state) == 2:  # 兼容无机制旧调用
         entered, counts = state
         open_gates = 0
@@ -138,36 +154,37 @@ def q_moves(pen_set, walls, queues, state, redirects=None, gate_edges=None,
     gate_edges = gate_edges or []
     gates = {edge: i for i, edge in enumerate(gate_edges)}
     occ = set()
-    for t, h, m in entered:
-        occ.add(t)
-        occ.add(h)
+    for cells, m in entered:
+        occ.update(cells)
     results = []
 
-    # 1. 释放各队列的队首猪
-    for qi, (c, d, total) in enumerate(queues):
+    # 1. 释放各队列的队首猪(长度由队列的体型序列决定)
+    for qi, (c, d, q2) in enumerate(queues):
         if counts[qi] == 0:
             continue
-        h0 = add(c, d)
-        t0 = add(h0, d)
-        if h0 in occ or t0 in occ:
+        lens = norm_lens(q2)
+        length = lens[len(lens) - counts[qi]]
+        spawn = tuple(add(c, (d[0] * k, d[1] * k))
+                      for k in range(1, length + 1))
+        if any(cell in occ for cell in spawn):
             continue
         m = neg(d)
-        acted, t, h, m, ng = _slide(
-            pen_set, walls, occ, t0, h0, m, redirects, gates, open_gates, muds)
+        acted, cells, m, ng = _slide(
+            pen_set, walls, occ, spawn, m, redirects, gates, open_gates, muds)
         if not acted:
             continue
-        ne = tuple(sorted(entered + ((t, h, m),)))
+        ne = tuple(sorted(entered + ((cells, m),)))
         nc = counts[:qi] + (counts[qi] - 1,) + counts[qi + 1:]
         results.append((ne, nc, ng))
 
     # 2. 已入场的猪再滑
-    for i, (t, h, m) in enumerate(entered):
-        occ2 = occ - {t, h}
-        acted, nt, nh, nm, ng = _slide(
-            pen_set, walls, occ2, t, h, m, redirects, gates, open_gates, muds)
+    for i, (cells, m) in enumerate(entered):
+        occ2 = occ - set(cells)
+        acted, ncells, nm, ng = _slide(
+            pen_set, walls, occ2, cells, m, redirects, gates, open_gates, muds)
         if not acted:
             continue
-        ne = tuple(sorted(entered[:i] + entered[i + 1:] + ((nt, nh, nm),)))
+        ne = tuple(sorted(entered[:i] + entered[i + 1:] + ((ncells, nm),)))
         results.append((ne, counts, ng))
     return results
 
@@ -176,13 +193,13 @@ def q_won(pen_set, state):
     entered, counts = state[:2]
     if any(counts):
         return False
-    return all(t in pen_set and h in pen_set for t, h, m in entered)
+    return all(all(c in pen_set for c in cells) for cells, m in entered)
 
 
 def solve(pen_set, walls, queues, max_depth=60, redirects=None, gate_edges=None,
           muds=None):
     """BFS 最短解;返回 最优步数 或 None。"""
-    init = ((), tuple(q[2] for q in queues), 0)
+    init = ((), tuple(len(norm_lens(q[2])) for q in queues), 0)
     seen = {init}
     q = deque([(init, 0)])
     while q:
@@ -211,7 +228,7 @@ def analyze(pen_set, walls, queues, budget, redirects=None, gate_edges=None,
             muds=None):
     """返回 {p_win, n_paths, crit, decep} 或 None(预算内不可解);
     状态数超过 DP_STATE_CAP 抛 TooLarge。"""
-    init = ((), tuple(q[2] for q in queues), 0)
+    init = ((), tuple(len(norm_lens(q[2])) for q in queues), 0)
 
     moves_memo = {}
 
@@ -339,7 +356,8 @@ def canon_sig(pen_set, queues, redirects=None, gate_edges=None, muds=None):
     best = None
     for k in range(8):
         pen = [_xform(c, k) for c in pen_set]
-        qs = [(_xform(c, k), _xform(add(c, d), k), n) for c, d, n in queues]
+        qs = [(_xform(c, k), _xform(add(c, d), k), norm_lens(n))
+              for c, d, n in queues]
         mx = min(c[0] for c in pen)
         my = min(c[1] for c in pen)
         pen_n = tuple(sorted((x - mx, y - my) for x, y in pen))
@@ -614,9 +632,12 @@ def construct(pen_set, tiling, rng, dir_tries=40):
     return None
 
 
-def ray_cells(c, d, count):
-    """一个开口在圈外需要的净空格:可见槽位(每头猪 2 格)+ 徽章格。"""
-    need = 2 * min(VISIBLE_PIGS, count) + (1 if count > VISIBLE_PIGS else 0)
+def ray_cells(c, d, q2):
+    """一个开口在圈外需要的净空格:可见槽位(按队首两头猪的体长)+ 徽章格。"""
+    lens = norm_lens(q2)
+    need = sum(lens[:VISIBLE_PIGS])
+    if len(lens) > VISIBLE_PIGS:
+        need += 1
     return [add(c, (d[0] * k, d[1] * k)) for k in range(1, need + 1)]
 
 

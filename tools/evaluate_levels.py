@@ -13,8 +13,8 @@ import sys
 from collections import Counter, deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from generate_levels import (DIRS, _xform, add, analyze, build_walls, q_moves,
-                             q_won)
+from generate_levels import (DIRS, _xform, add, analyze, build_walls,
+                             norm_lens, q_moves, q_won)
 
 HIGH_SIMILARITY = 0.86
 HIGH_METHOD = 0.92
@@ -29,7 +29,7 @@ def load_levels(path=None):
         out.append({
             'steps': int(level['steps']), 'min': int(level['min']),
             'pen': set(map(tuple, level['pen'])),
-            'queues': [(tuple(c), tuple(d), int(n))
+            'queues': [(tuple(c), tuple(d), norm_lens(n))
                        for c, d, n in level['queues']],
             'redirects': {tuple(c): tuple(d)
                           for c, d in level.get('redirects', [])},
@@ -46,7 +46,8 @@ def _counter_diff(after, before):
 
 
 def transition_token(level, state, nxt):
-    """D4-invariant description of one move on a shortest solution."""
+    """D4-invariant description of one move on a shortest solution.
+    猪 = (身体格元组(头在前), 方向)。"""
     entered, counts, gate_mask = state
     ne, nc, ng = nxt
     released = sum(nc) < sum(counts)
@@ -54,29 +55,31 @@ def transition_token(level, state, nxt):
     removed = _counter_diff(entered, ne)
     new_pig = added[0] if added else None
     old_pig = removed[0] if removed else None
-    turned = bool(old_pig and new_pig and old_pig[2] != new_pig[2])
+    turned = bool(old_pig and new_pig and old_pig[1] != new_pig[1])
     if released and new_pig:
         qi = next(i for i in range(len(counts)) if nc[i] < counts[i])
-        turned = new_pig[2] != (-level['queues'][qi][1][0],
+        turned = new_pig[1] != (-level['queues'][qi][1][0],
                                 -level['queues'][qi][1][1])
         start_head = add(level['queues'][qi][0], level['queues'][qi][1])
     elif old_pig:
-        start_head = old_pig[1]
+        start_head = old_pig[0][0]
     else:
-        start_head = new_pig[1] if new_pig else (0, 0)
-    distance = (abs(new_pig[1][0] - start_head[0])
-                + abs(new_pig[1][1] - start_head[1])) if new_pig else 0
+        start_head = new_pig[0][0] if new_pig else (0, 0)
+    head = new_pig[0][0] if new_pig else start_head
+    distance = (abs(head[0] - start_head[0])
+                + abs(head[1] - start_head[1])) if new_pig else 0
     dist_bucket = min(distance, 3)
-    fully_inside = bool(new_pig and new_pig[0] in level['pen']
-                        and new_pig[1] in level['pen'])
-    in_mud = bool(new_pig and new_pig[1] in level.get('muds', ()))
+    fully_inside = bool(new_pig
+                        and all(c in level['pen'] for c in new_pig[0]))
+    in_mud = bool(new_pig and new_pig[0][0] in level.get('muds', ()))
+    size_char = str(len(new_pig[0])) if new_pig else '0'
     return ('Q' if released else 'P', 'R' if turned else '-', str(dist_bucket),
-            'I' if fully_inside else 'X', 'M' if in_mud else '-')
+            'I' if fully_inside else 'X', 'M' if in_mud else '-', size_char)
 
 
 def shortest_method(level):
     walls = build_walls(level['pen'], [(c, d) for c, d, _ in level['queues']])
-    init = ((), tuple(q[2] for q in level['queues']), 0)
+    init = ((), tuple(len(q[2]) for q in level['queues']), 0)
     queue = deque([init])
     parent = {init: None}
     action = {}
@@ -104,17 +107,22 @@ def shortest_method(level):
 
 
 def difficulty(level, metrics, search_states):
-    """Monotone score: scale, exact risk, reasoning depth, and mechanisms."""
-    pigs = sum(q[2] for q in level['queues'])
+    """Monotone score: scale, exact risk, reasoning depth, and mechanisms.
+    全 2 格猪的关卡分数与旧公式完全一致(混编项为 0)。"""
+    lens = [x for q in level['queues'] for x in q[2]]
+    pigs = len(lens)
     scarcity = max(0.0, 3.0 - math.log10(1 + metrics['n_paths']))
     return round(
         1.35 * pigs + 0.75 * level['min']
         + 3.2 * (1.0 - metrics['p_win'])
         + 0.55 * metrics['crit'] + 0.28 * metrics['decep']
-        + 0.45 * (max(q[2] for q in level['queues']) - 1)
+        + 0.45 * (max(len(q[2]) for q in level['queues']) - 1)
         + 0.45 * scarcity + 0.18 * math.log10(1 + search_states)
         + 0.35 * len(level['redirects'])
-        + 0.40 * len(level.get('muds') or ()), 3)
+        + 0.40 * len(level.get('muds') or ())
+        + 0.45 * (len(set(lens)) - 1)
+        + 0.30 * sum(1 for x in lens if x == 3)
+        + 0.20 * sum(1 for x in lens if x == 1), 3)
 
 
 def _normalized_shape(pen, transform):
@@ -149,10 +157,16 @@ def _multiset_similarity(a, b):
 def structural_similarity(a, b):
     shape = shape_similarity(a, b)
     queues = _multiset_similarity(
-        [q[2] for q in a['queues']], [q[2] for q in b['queues']])
+        [tuple(q[2]) for q in a['queues']], [tuple(q[2]) for q in b['queues']])
+
+    def _mix(level):
+        lens = [x for q in level['queues'] for x in q[2]]
+        return (sum(1 for x in lens if x == 3), sum(1 for x in lens if x == 1))
+    mix_a, mix_b = _mix(a), _mix(b)
     mechanics = 1.0 - min(1.0,
         (abs(len(a['redirects']) - len(b['redirects']))
-         + abs(len(a.get('muds') or ()) - len(b.get('muds') or ()))) / 2.0)
+         + abs(len(a.get('muds') or ()) - len(b.get('muds') or ()))
+         + 0.5 * (abs(mix_a[0] - mix_b[0]) + abs(mix_a[1] - mix_b[1]))) / 2.0)
     scale = 1.0 - min(1.0, abs(len(a['pen']) - len(b['pen']))
                       / max(len(a['pen']), len(b['pen']), 1))
     return 0.50 * shape + 0.25 * queues + 0.15 * mechanics + 0.10 * scale
@@ -172,15 +186,33 @@ def sequence_similarity(a, b):
     return 1.0 - prev[-1] / max(len(a), len(b), 1)
 
 
+def _eval_one(level):
+    """单关精确指标(供并行池调用;确定性,与串行结果一致)。"""
+    walls = build_walls(level['pen'],
+                        [(c, d) for c, d, _ in level['queues']])
+    metrics = analyze(level['pen'], walls, level['queues'], level['steps'],
+                      level['redirects'], level['gates'],
+                      level.get('muds'))
+    method, states = shortest_method(level)
+    return metrics, method, states
+
+
 def evaluate(levels):
     rows = []
-    for i, level in enumerate(levels):
-        walls = build_walls(level['pen'],
-                            [(c, d) for c, d, _ in level['queues']])
-        metrics = analyze(level['pen'], walls, level['queues'], level['steps'],
-                          level['redirects'], level['gates'],
-                          level.get('muds'))
-        method, states = shortest_method(level)
+    results = None
+    if len(levels) >= 64:
+        # 大批量走多进程:每关分析相互独立,按下标回收保证确定性
+        try:
+            import multiprocessing as mp
+            with mp.get_context('fork').Pool(
+                    max(2, min(8, mp.cpu_count() - 1))) as pool:
+                results = pool.map(_eval_one, levels, chunksize=8)
+        except Exception:
+            results = None
+    if results is None:
+        results = [_eval_one(level) for level in levels]
+    for i, (level, (metrics, method, states)) in enumerate(
+            zip(levels, results)):
         rows.append({'index': i, 'level': level, 'metrics': metrics,
                      'method': method, 'states': states,
                      'difficulty': difficulty(level, metrics, states)})
@@ -211,7 +243,7 @@ def report(rows, pairs):
         level, m = row['level'], row['metrics']
         lines.append('| %03d | %.3f | %d | %d | %.4f | %d | %d | %d | %d |'
                      % (row['index'] + 1, row['difficulty'],
-                        sum(q[2] for q in level['queues']), level['min'],
+                        sum(len(q[2]) for q in level['queues']), level['min'],
                         m['p_win'], m['crit'], m['decep'],
                         len(level['redirects']),
                         len(level.get('muds') or ())))

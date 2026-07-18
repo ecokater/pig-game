@@ -15,8 +15,8 @@ from evaluate_levels import (HIGH_METHOD, HIGH_SIMILARITY, difficulty, evaluate,
                              sequence_similarity, shortest_method,
                              structural_similarity)
 from generate_levels import (DIRS, TooLarge, add, analyze, build_walls,
-                             canon_sig, construct, gen_shape, random_tiling,
-                             ray_cells, solve)
+                             canon_sig, construct, gen_shape, norm_lens,
+                             random_tiling, ray_cells, solve)
 from mechanize_levels import _raw_level, build_report
 
 SEED = 20260717
@@ -27,7 +27,8 @@ def parse(raw):
     return {
         'steps': raw['steps'], 'min': raw['min'],
         'pen': set(map(tuple, raw['pen'])),
-        'queues': [(tuple(c), tuple(d), int(n)) for c, d, n in raw['queues']],
+        'queues': [(tuple(c), tuple(d), norm_lens(n))
+                   for c, d, n in raw['queues']],
         'redirects': {tuple(c): tuple(d)
                       for c, d in raw.get('redirects', [])},
         'muds': set(map(tuple, raw.get('muds', []))),
@@ -167,7 +168,7 @@ def rebuild(levels, rng):
     attempts_log = []
     for index in flagged:
         old = parsed[index]
-        n = sum(q[2] for q in old['queues'])
+        n = sum(len(q[2]) for q in old['queues'])
         slack = old['steps'] - old['min']
         want_redirect = bool(old['redirects'])
         want_gate = bool(old['gates'])

@@ -24,7 +24,7 @@ from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from generate_levels import (   # noqa: E402
-    build_walls, solve, analyze, canon_sig, ray_cells, add,
+    build_walls, solve, analyze, canon_sig, norm_lens, ray_cells, add,
     PEN_MAX_W, PEN_MAX_H, TooLarge)
 
 
@@ -40,7 +40,8 @@ def load_levels():
             'steps': lv['steps'],
             'min': lv['min'],
             'pen': [tuple(c) for c in lv['pen']],
-            'queues': [(tuple(c), tuple(d), int(n)) for c, d, n in lv['queues']],
+            'queues': [(tuple(c), tuple(d), norm_lens(n))
+                       for c, d, n in lv['queues']],
             'redirects': {tuple(c): tuple(d) for c, d in lv.get('redirects', [])},
             'muds': set(map(tuple, lv.get('muds', []))),
             'gates': [],
@@ -62,119 +63,135 @@ def connected(pen_set):
     return len(seen) == len(pen_set)
 
 
+def _verify_one(item):
+    """单关全部硬性检查(并行 worker;D4 查重在主进程)。"""
+    i, lv = item
+    pen_set = set(lv['pen'])
+    queues = lv['queues']
+    redirects = lv['redirects']
+    gates = [tuple(sorted(g)) for g in lv['gates']]
+    n = sum(len(lens) for _, _, lens in queues)
+    pig_cells = sum(sum(lens) for _, _, lens in queues)
+    errs = []
+    if any(x not in (1, 2, 3) for _, _, lens in queues for x in lens):
+        errs.append("猪体长只允许 1/2/3")
+
+    # 连通性与本体尺寸
+    if not connected(pen_set):
+        errs.append("猪圈不连通")
+    xs = [c[0] for c in pen_set]
+    ys = [c[1] for c in pen_set]
+    pw = max(xs) - min(xs) + 1
+    ph = max(ys) - min(ys) + 1
+    if pw > PEN_MAX_W or ph > PEN_MAX_H:
+        errs.append(f"猪圈超限 {pw}x{ph}")
+
+    # 恰好填满
+    if pig_cells != len(pen_set):
+        errs.append(f"猪格数 {pig_cells} != 圈格数 {len(pen_set)}")
+
+    # 圈外净空
+    used = set()
+    for c, d, cnt in queues:
+        for cell in ray_cells(c, d, cnt):
+            if cell in pen_set:
+                errs.append("槽位压到猪圈")
+                break
+            if cell in used:
+                errs.append("槽位互相重叠")
+                break
+            used.add(cell)
+
+    # 机制格合法性
+    muds = lv['muds']
+    for c, d in redirects.items():
+        if c not in pen_set or d not in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            errs.append("箭头位置或方向非法")
+    for c in muds:
+        if c not in pen_set:
+            errs.append("泥坑必须在圈内")
+        if c in redirects:
+            errs.append("泥坑与箭头不能同格")
+    for a, b in gates:
+        if (a not in pen_set or b not in pen_set
+                or abs(a[0] - b[0]) + abs(a[1] - b[1]) != 1):
+            errs.append("门必须位于两个相邻圈内格之间")
+
+    sig = canon_sig(pen_set, queues, redirects, gates, muds)
+
+    # 可解性与精确分析
+    walls = build_walls(pen_set, [(c, d) for c, d, _ in queues])
+    min_steps = solve(pen_set, walls, queues, redirects=redirects,
+                      gate_edges=gates, muds=muds)
+    a = None
+    if min_steps is None:
+        errs.append("BFS 无解")
+    elif min_steps != lv['min']:
+        errs.append(f"最优 {min_steps} != 存档 {lv['min']}")
+    elif min_steps > lv['steps']:
+        errs.append(f"最优 {min_steps} > 预算 {lv['steps']}")
+    else:
+        # 机制必须参与解法，禁止只摆一个不影响路径的装饰物。
+        if redirects:
+            without_redirect = solve(
+                pen_set, walls, queues, redirects={}, gate_edges=gates,
+                muds=muds)
+            if without_redirect == min_steps:
+                errs.append("箭头未改变最优解")
+        if muds:
+            without_mud = solve(
+                pen_set, walls, queues, redirects=redirects,
+                gate_edges=gates, muds=set())
+            if without_mud == min_steps:
+                errs.append("泥坑未改变最优解")
+        if gates:
+            without_gate = solve(
+                pen_set, walls, queues, redirects=redirects, gate_edges=[],
+                muds=muds)
+            if without_gate is None or without_gate >= min_steps:
+                errs.append("门未形成额外开门接力")
+        try:
+            a = analyze(pen_set, walls, queues, lv['steps'], redirects,
+                        gates, muds)
+        except TooLarge:
+            errs.append("状态空间超限")
+        if a is None and not errs:
+            errs.append("p_win=0(预算内不可解)")
+
+    max_q = max(len(lens) for _, _, lens in queues)
+    if a is not None:
+        diff = (1.2 * n + 3.0 * (1 - a['p_win']) + 0.5 * a['crit']
+                + 0.25 * a['decep'] + 0.5 * (max_q - 1))
+        body = (f"L{i+1:03d} {n:4d} {min_steps:4d} {lv['steps']:3d} "
+                f"{max_q:2d} {len(queues):2d} {a['p_win']*100:6.2f} "
+                f"{a['crit']:4d} {a['decep']:3d} "
+                f"{min(a['n_paths'], 99999999):8d} {diff:5.2f}  {pw}x{ph}")
+    else:
+        body = (f"L{i+1:03d} {n:4d}  --  {lv['steps']:3d} "
+                f"{'':>34s} {pw}x{ph}")
+    return {'i': i, 'sig': sig, 'errs': errs, 'body': body}
+
+
 def main():
     levels = load_levels()
-    print(f"复验 {len(levels)} 关(队列模型,精确状态空间分析)……")
+    print(f"复验 {len(levels)} 关(队列模型,精确状态空间分析,多进程)……")
     print("#    pigs  min bud qu op  p_win  crit dcp    paths  diff  pen   状态")
     print("-" * 76)
 
+    import multiprocessing as mp
+    with mp.get_context('fork').Pool(
+            max(2, min(8, mp.cpu_count() - 1))) as pool:
+        results = pool.map(_verify_one, list(enumerate(levels)), chunksize=4)
+
     all_ok = True
     canons = {}
-    for i, lv in enumerate(levels):
-        pen_set = set(lv['pen'])
-        queues = lv['queues']
-        redirects = lv['redirects']
-        gates = [tuple(sorted(g)) for g in lv['gates']]
-        n = sum(cnt for _, _, cnt in queues)
-        errs = []
-
-        # 连通性与本体尺寸
-        if not connected(pen_set):
-            errs.append("猪圈不连通")
-        xs = [c[0] for c in pen_set]
-        ys = [c[1] for c in pen_set]
-        pw = max(xs) - min(xs) + 1
-        ph = max(ys) - min(ys) + 1
-        if pw > PEN_MAX_W or ph > PEN_MAX_H:
-            errs.append(f"猪圈超限 {pw}x{ph}")
-
-        # 恰好填满
-        if 2 * n != len(pen_set):
-            errs.append(f"猪格数 {2*n} != 圈格数 {len(pen_set)}")
-
-        # 圈外净空
-        used = set()
-        for c, d, cnt in queues:
-            for cell in ray_cells(c, d, cnt):
-                if cell in pen_set:
-                    errs.append("槽位压到猪圈")
-                    break
-                if cell in used:
-                    errs.append("槽位互相重叠")
-                    break
-                used.add(cell)
-
-        # 机制格合法性
-        muds = lv['muds']
-        for c, d in redirects.items():
-            if c not in pen_set or d not in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                errs.append("箭头位置或方向非法")
-        for c in muds:
-            if c not in pen_set:
-                errs.append("泥坑必须在圈内")
-            if c in redirects:
-                errs.append("泥坑与箭头不能同格")
-        for a, b in gates:
-            if (a not in pen_set or b not in pen_set
-                    or abs(a[0] - b[0]) + abs(a[1] - b[1]) != 1):
-                errs.append("门必须位于两个相邻圈内格之间")
-
-        sig = canon_sig(pen_set, queues, redirects, gates, muds)
+    for r in results:
+        errs = r['errs']
+        sig = r['sig']
         if sig in canons:
             errs.append(f"与 L{canons[sig]+1:03d} 旋转/镜像同构")
-        canons[sig] = i
-
-        # 可解性与精确分析
-        walls = build_walls(pen_set, [(c, d) for c, d, _ in queues])
-        min_steps = solve(pen_set, walls, queues, redirects=redirects,
-                          gate_edges=gates, muds=muds)
-        a = None
-        if min_steps is None:
-            errs.append("BFS 无解")
-        elif min_steps != lv['min']:
-            errs.append(f"最优 {min_steps} != 存档 {lv['min']}")
-        elif min_steps > lv['steps']:
-            errs.append(f"最优 {min_steps} > 预算 {lv['steps']}")
-        else:
-            # 机制必须参与解法，禁止只摆一个不影响路径的装饰物。
-            if redirects:
-                without_redirect = solve(
-                    pen_set, walls, queues, redirects={}, gate_edges=gates,
-                    muds=muds)
-                if without_redirect == min_steps:
-                    errs.append("箭头未改变最优解")
-            if muds:
-                without_mud = solve(
-                    pen_set, walls, queues, redirects=redirects,
-                    gate_edges=gates, muds=set())
-                if without_mud == min_steps:
-                    errs.append("泥坑未改变最优解")
-            if gates:
-                without_gate = solve(
-                    pen_set, walls, queues, redirects=redirects, gate_edges=[],
-                    muds=muds)
-                if without_gate is None or without_gate >= min_steps:
-                    errs.append("门未形成额外开门接力")
-            try:
-                a = analyze(pen_set, walls, queues, lv['steps'], redirects,
-                            gates, muds)
-            except TooLarge:
-                errs.append("状态空间超限")
-            if a is None and not errs:
-                errs.append("p_win=0(预算内不可解)")
-
-        max_q = max(cnt for _, _, cnt in queues)
-        if a is not None:
-            diff = (1.2 * n + 3.0 * (1 - a['p_win']) + 0.5 * a['crit']
-                    + 0.25 * a['decep'] + 0.5 * (max_q - 1))
-            print(f"L{i+1:03d} {n:4d} {min_steps:4d} {lv['steps']:3d} "
-                  f"{max_q:2d} {len(queues):2d} {a['p_win']*100:6.2f} "
-                  f"{a['crit']:4d} {a['decep']:3d} "
-                  f"{min(a['n_paths'], 99999999):8d} {diff:5.2f}  "
-                  f"{pw}x{ph}  {'OK' if not errs else ';'.join(errs)}")
-        else:
-            print(f"L{i+1:03d} {n:4d}  --  {lv['steps']:3d} "
-                  f"{'':>34s} {pw}x{ph}  {';'.join(errs)}")
+        canons[sig] = r['i']
+        print(f"{r['body']}  {'OK' if not errs else ';'.join(errs)}")
         if errs:
             all_ok = False
 

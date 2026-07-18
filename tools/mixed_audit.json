@@ -1,0 +1,16 @@
+{
+  "seed": 20260723,
+  "levels": 1000,
+  "mixed_levels": 303,
+  "mixed_first_level": 3,
+  "mixed_in_last_100": 87,
+  "piglet_pigs": 525,
+  "long_pigs": 703,
+  "difficulty_min": 5.461,
+  "difficulty_max": 51.525,
+  "old_difficulty_max": 44.565,
+  "levels_above_old_max": 64,
+  "redirect_levels": 866,
+  "mud_levels": 353,
+  "high_similarity_pairs": 0
+}
