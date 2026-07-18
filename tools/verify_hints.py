@@ -41,12 +41,19 @@ def shortest_state_path(level):
 
 
 def _verify_hint_level(item):
-    """单关提示审计(并行 worker):返回 (检查状态数, 是否多箭头) 或抛错。"""
+    """单关提示审计(并行 worker):返回 (检查状态数, 是否多箭头) 或抛错。
+    若关卡带官方解线 "sol",同时复核其编码与最短路径逐步一致。"""
     index, level = item
     path, walls = shortest_state_path(level)
     if len(path) - 1 != level['min']:
         raise AssertionError(
             f'L{index + 1:04d}: hint path {len(path)-1} != min {level["min"]}')
+    sol = level['raw'].get('sol') if 'raw' in level else None
+    if sol is not None:
+        from export_solutions import encode_move
+        expect = [encode_move(a, b) for a, b in zip(path, path[1:])]
+        if [list(m) for m in sol] != expect:
+            raise AssertionError(f'L{index + 1:04d}: 官方解线与最短路径不一致')
     checked = 0
     for step, (state, hinted) in enumerate(zip(path, path[1:])):
         legal = q_moves(level['pen'], walls, level['queues'], state,

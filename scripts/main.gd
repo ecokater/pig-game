@@ -67,7 +67,18 @@ var _dfs_nodes := 0
 var _dfs_budget := 0
 var _dfs_overflow := false
 const DOOM_BUDGET := 30000
-const HINT_BUDGET := 400000
+const HINT_BUDGET := 120000
+
+# 求解全部在后台线程跑(决赛段状态空间大,主线程会冻结数秒到分钟级)
+var _solver_thread: Thread = null
+var _solver_abort := false     # 线程内的 _dfs 定期检查,置位后尽快退出
+var _solver_gen := 0           # 局面代数:移动/撤销/加步都会 +1,过期结果丢弃
+var _doom_dirty := false       # 求解器忙时收到的死局复查请求,空闲后补跑
+
+# 官方解线回放:levels.json 携带每关一条已验证的最短解;
+# 玩家沿最优线走时,"提示"瞬时响应,不需要实时求解
+var solution: Array = []       # [[0,qi] 释放队列 | [1,x,y] 点头格在(x,y)的猪]
+var _history: Array = []       # 本关已执行移动(同编码),撤销时回退
 
 var _title: Label
 var _steps_label: Label
@@ -151,6 +162,9 @@ static func _load_levels_from_json() -> Array:
 				Vector2i(int(r[0][0]), int(r[0][1])),
 				Vector2i(int(r[1][0]), int(r[1][1])),
 			])
+		var parsed_sol: Array = []
+		for mv in lv.get("sol", []):
+			parsed_sol.append(mv)
 		result.append({
 			"steps": int(lv["steps"]),
 			"min": int(lv.get("min", lv["steps"])),
@@ -158,6 +172,7 @@ static func _load_levels_from_json() -> Array:
 			"queues": parsed_queues,
 			"redirects": parsed_redirects,
 			"muds": _parse_v2i_array(lv.get("muds", [])),
+			"sol": parsed_sol,
 		})
 	return result
 
@@ -230,6 +245,8 @@ func _load_level(lv: Dictionary) -> void:
 	muds.clear()
 	for m in lv.get("muds", []):
 		muds[m] = true
+	solution = lv.get("sol", [])
+	_history = []
 	steps_left = max_steps
 	moves_made = 0
 
@@ -453,6 +470,8 @@ func _tap_pig(pig: Node2D) -> void:
 	for pg in pigs:
 		snap["pigs"].append([pg, pg.cells.duplicate(), pg.dir, pg.entered])
 
+	var head_before: Vector2i = pig.cells[0]
+	var was_waiting: bool = not pig.entered
 	var moved := 0
 	var snaps: Array = []
 	while true:
@@ -494,6 +513,14 @@ func _tap_pig(pig: Node2D) -> void:
 	if not pig.entered:
 		pig.entered = true   # 队首进圈(或跨在开口上),离开等待队列
 
+	# 记录移动(与官方解线同编码),供提示回放与撤销回退
+	if was_waiting:
+		_history.append([0, pig.qi])
+	else:
+		_history.append([1, head_before.x, head_before.y])
+	_solver_gen += 1
+	_solver_abort = true
+
 	steps_left -= 1
 	moves_made += 1
 	_update_steps_label()
@@ -503,7 +530,7 @@ func _tap_pig(pig: Node2D) -> void:
 	_relayout_queues(true)
 	_check_state()
 	if not game_over:
-		_update_doom()
+		_request_doom()
 
 
 func _restore_snapshot(snap: Dictionary) -> void:
@@ -558,15 +585,72 @@ func _check_state() -> void:
 		_fail()
 
 
-# ---------- 死局感知 ----------
-## 每次局面变化后用限额精确求解器复查:确认无解就立刻示警,
-## 把"隐藏的欺骗深度"变成看得见的紧张感,而不是走了 8 步才发现被骗。
+# ---------- 后台求解与死局感知 ----------
+## 求解在后台线程执行,主线程零冻结。结果带"局面代数",过期即丢弃。
+## 死局感知:确认无解就立刻示警,把"隐藏的欺骗深度"变成看得见的紧张感。
 
-func _update_doom() -> void:
+func _solver_busy() -> bool:
+	return _solver_thread != null
+
+
+func _start_solver(kind: String, budget: int) -> void:
+	_solver_abort = false
+	var ctx := {
+		"kind": kind, "budget": budget, "gen": _solver_gen,
+		"steps": steps_left,
+	}
+	var entered: Array = []
+	var counts: Array = []
+	for pig in pigs:
+		if pig.entered:
+			entered.append([pig.cells.duplicate(), pig.dir])
+	for qi in queues.size():
+		counts.append(_waiting_list(qi).size())
+	entered.sort()
+	ctx["entered"] = entered
+	ctx["counts"] = counts
+	_solver_thread = Thread.new()
+	_solver_thread.start(_solver_main.bind(ctx))
+
+
+func _solver_main(ctx: Dictionary) -> void:
+	# 线程入口:只读棋盘常量(墙/箭头/泥坑仅在换关时变化,换关前会 join)
+	_dfs_nodes = 0
+	_dfs_budget = int(ctx["budget"])
+	_dfs_overflow = false
+	var visited := {}
+	var seq = _dfs(ctx["entered"], ctx["counts"], int(ctx["steps"]), visited)
+	call_deferred("_solver_done", ctx, seq, _dfs_overflow)
+
+
+func _solver_done(ctx: Dictionary, seq: Variant, overflow: bool) -> void:
+	if _solver_thread != null:
+		_solver_thread.wait_to_finish()
+		_solver_thread = null
+	var fresh: bool = int(ctx["gen"]) == _solver_gen and not game_over
+	if ctx["kind"] == "hint":
+		_refresh_boosters()
+		if fresh:
+			_deliver_hint(seq, overflow)
+	else:
+		if fresh:
+			_apply_doom(seq == null and not overflow)
+	# 求解器忙时积压的死局复查,现在补跑
+	if _doom_dirty and not _solver_busy() and not game_over:
+		_doom_dirty = false
+		_start_solver("doom", DOOM_BUDGET)
+
+
+func _request_doom() -> void:
 	if game_over:
 		return
-	var seq = _solve_from_current(DOOM_BUDGET)
-	var doomed_now: bool = (seq == null) and not _dfs_overflow
+	if _solver_busy():
+		_doom_dirty = true
+		return
+	_start_solver("doom", DOOM_BUDGET)
+
+
+func _apply_doom(doomed_now: bool) -> void:
 	if doomed_now and not _doomed:
 		_toast("🐻 熊嗅到了危险……这条路走不通了,试试撤销")
 		if bear != null:
@@ -576,6 +660,13 @@ func _update_doom() -> void:
 	_doomed = doomed_now
 	_steps_label.add_theme_color_override("font_color",
 			Color(1.0, 0.42, 0.36) if _doomed else Color(1, 1, 0.75))
+
+
+func _exit_tree() -> void:
+	_solver_abort = true
+	if _solver_thread != null:
+		_solver_thread.wait_to_finish()
+		_solver_thread = null
 
 
 # ---------- 滑行轨迹预览 ----------
@@ -665,19 +756,69 @@ func _do_undo() -> void:
 		return
 	var snap: Dictionary = _undo_stack.pop_back()
 	_restore_snapshot(snap)
+	if not _history.is_empty():
+		_history.pop_back()
+	_solver_gen += 1
+	_solver_abort = true
 	_preview_pig = null
 	_overlay.queue_redraw()
 	_refresh_topbar()
 	_refresh_boosters()
-	_update_doom()
+	_request_doom()
 
 
 func _do_hint() -> void:
 	if game_over or animating:
 		return
-	var seq = _solve_from_current(HINT_BUDGET)
+	# 1) 官方解线回放:玩家仍在最优线上 → 瞬时给下一手,零计算
+	if _on_solution_line():
+		var mv: Array = solution[_history.size()]
+		if not Meta.use_booster("hint"):
+			_toast("金币不足")
+			return
+		_flash_move(mv)
+		_refresh_topbar()
+		_refresh_boosters()
+		return
+	# 2) 偏离解线 → 后台求解,不冻结画面
+	if _solver_busy():
+		_toast("💡 还在计算中,稍等…")
+		return
+	_hint_btn.text = "💡 计算中…"
+	_start_solver("hint", HINT_BUDGET)
+
+
+func _on_solution_line() -> bool:
+	if solution.is_empty() or _history.size() >= solution.size():
+		return false
+	for i in _history.size():
+		var a: Array = _history[i]
+		var b: Array = solution[i]
+		if a.size() != b.size():
+			return false
+		for j in a.size():
+			if int(a[j]) != int(b[j]):
+				return false
+	return true
+
+
+func _flash_move(mv: Array) -> void:
+	if int(mv[0]) == 0:
+		var waiting := _waiting_list(int(mv[1]))
+		if not waiting.is_empty():
+			waiting[0].flash()
+	else:
+		var head := Vector2i(int(mv[1]), int(mv[2]))
+		for pig in pigs:
+			if pig.entered and pig.cells[0] == head:
+				pig.flash()
+				break
+
+
+func _deliver_hint(seq: Variant, overflow: bool) -> void:
+	## 后台求解结果送达(仅当局面未变时调用)
 	if seq == null or (seq as Array).is_empty():
-		if _dfs_overflow:
+		if overflow:
 			_toast("局面太复杂,提示一时算不出来…先凭直觉走一步?")
 		else:
 			_toast("当前局面在剩余步数内已无解,试试撤销")
@@ -706,10 +847,12 @@ func _do_extra_steps() -> void:
 		_toast("金币不足")
 		return
 	steps_left += 2
+	_solver_gen += 1
+	_solver_abort = true
 	_update_steps_label()
 	_refresh_topbar()
 	_refresh_boosters()
-	_update_doom()
+	_request_doom()
 
 
 # ---------- 实时求解(提示道具用) ----------
@@ -782,7 +925,7 @@ func _dfs(entered: Array, counts: Array, remaining: int,
 		return null
 	visited[key] = remaining
 	_dfs_nodes += 1
-	if _dfs_nodes > _dfs_budget:
+	if _dfs_nodes > _dfs_budget or _solver_abort:
 		_dfs_overflow = true
 		return null
 
@@ -959,10 +1102,12 @@ func _on_btn_pressed() -> void:
 			if Meta.try_spend(Meta.CONTINUE_PRICE):
 				game_over = false
 				steps_left += 2
+				_solver_gen += 1
+				_solver_abort = true
 				_panel.visible = false
 				_update_steps_label()
 				_refresh_topbar()
-				_update_doom()
+				_request_doom()
 			return
 		"advance":
 			if level_index < levels.size() - 1:
