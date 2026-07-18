@@ -934,13 +934,15 @@ func _dfs(entered: Array, counts: Array, remaining: int,
 		for cc in p[0]:
 			occ[cc] = true
 
-	# 释放某队队首(体长取自真实队列的对应位置)
+	# 释放某队队首。体长取自关卡定义的静态体长序列(lens 队首在前):
+	# 剩 counts[qi] 头时,下一头是第 lens.size()-counts[qi] 个。
+	# 不能读活猪节点(_waiting_list)——本函数在后台线程跑,
+	# 主线程随时在改 pig.entered,竞争会产生 -1 下标崩溃。
 	for qi in counts.size():
 		if counts[qi] == 0:
 			continue
-		var waiting := _waiting_list(qi)
-		var next_pig: Node2D = waiting[waiting.size() - counts[qi]]
-		var length: int = next_pig.length()
+		var qlens: Array = queues[qi]["lens"]
+		var length: int = int(qlens[qlens.size() - counts[qi]])
 		var c: Vector2i = queues[qi]["cell"]
 		var d: Vector2i = queues[qi]["dir"]
 		var spawn: Array = []
