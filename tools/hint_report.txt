@@ -1,1 +1,1 @@
-ALL 1000 LEVEL HINTS OK; path_states=10720; multi_redirect_levels=414
+ALL 1000 LEVEL HINTS OK; path_states=8468; multi_redirect_levels=84

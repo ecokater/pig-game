@@ -95,7 +95,9 @@ Gate 相关运行时代码已经删除，最终 `levels.json` 也完全不含 `g
   "pen": [[0, 0], [0, 1]],
   "queues": [[[0, 0], [-1, 0], 2]],
   "redirects": [[[2, 3], [1, 0]], [[4, 3], [0, 1]]],
-  "muds": [[1, 2]]
+  "muds": [[1, 2]],
+  "arch": "cross",
+  "sol": [[0, 0], [1, 3, 2]]
 }
 ```
 
@@ -107,40 +109,41 @@ Gate 相关运行时代码已经删除，最终 `levels.json` 也完全不含 `g
 
 第三项为 int 时表示"全部 2 格猪"(旧格式,仍兼容);为数组时是体长序列,
 如 `[3,2,1]`,队首在前。`muds` 是泥坑格列表。`steps` 是步数预算,
-`min` 是精确 BFS 最短步数。
+`min` 是精确 BFS 最短步数。`arch` 是玩法原型标签(八种之一,验证器复核
+名副其实)。`sol` 是官方最短解线(`[0,qi]`=释放第 qi 队队首;
+`[1,x,y]`=点击头格在 (x,y) 的已入场猪),游戏内提示优先回放它。
 
-## 5. 1000 关生成流水线
+## 5. 1000 关生成流水线（原型体系,当前主线）
 
-主入口：
+**主入口(一步到位,从零组装 1000 关)**:
 
 ```bash
-python3 tools/generate_levels.py
+python3 tools/build_set.py --seconds 150 --cap 190
 ```
 
-流水线组成：
+组成:
 
-1. `tools/generate_levels.py`
-   - 构造 100 关基础候选；
-   - 随机骨牌平铺、队列构造、精确求解和 D4 去重。
-2. `tools/mechanize_levels.py`
-   - 向基础教学关编入 Redirect。
-3. `tools/rebuild_similar_levels.py`
-   - 重做所有超过结构/解法相似度阈值的关卡端点；
-   - 按精确难度分排序。
-4. `tools/expand_to_1000.py`
-   - 从 100 关扩展至 1000 关；
-   - 新增关使用解法必需的 Redirect；
-   - 后段提升到 13–14 猪、零步数余量。
-5. `tools/upgrade_multi_redirect.py`
-   - 将高难段 450 关替换为双/三箭头关；
-   - 新候选仍需在线通过相似度检查。
-6. `tools/finalize_arrow_1000.py`
-   - 一次性生成最终难度报告、相似度报告和扩展审计。
-7. `tools/add_mud.py`
-   - 向 L151–L900 难度带的 300 关编入解法必需的 Mud 泥坑(1–2 个),
-     在线重查 D4 签名与相似度,难度分不越过 L901,完成后全局重排并重写报告。
+1. `tools/archetypes.py`
+   - 八种玩法原型的生成配方(`generate`)与结构判别谓词(`classify`)。
+     原型:solo/line/cross/pinwheel/mirror/parking/jumbo/swarm(见 README 表)。
+   - 全部构建在 `add_mixed_pigs.construct_mixed`(精确填满证明)之上,
+     只偏置形状/体型/方向/机制,再用 `classify` 谓词筛出符合的候选。
+2. `tools/build_set.py`
+   - 并行为八种原型各生成一大批候选(每个都经精确分析、非装饰机制复核);
+   - D4 去重 + 结构/解法相似度贪心去重;
+   - 每原型均衡配额(各 125 关),按难度分**严格非递减**排序,
+     等难度处交换打散相邻同原型;
+   - 每关写 `arch` 标签,调用 `export_solutions` 导出官方解线 `sol`,
+     写 `tools/archetype_audit.json`。
+   - 种子 `20260725`。
 
-固定种子主要为 `20260716`、`20260718`、`20260719`、`20260721`。
+**旧的箭头/泥坑逐步流水线**(generate_levels → mechanize → rebuild_similar →
+expand_to_1000 → upgrade_multi_redirect → finalize_arrow_1000 → add_mud →
+add_mixed_pigs)已被 `build_set.py` 取代,脚本保留供参考;其中的规则内核
+(`generate_levels.py` 的 `construct_mixed` 借道 `add_mixed_pigs`、`solve`、
+`analyze`、`canon_sig` 等)仍是 `build_set` 的底座,不要删。
+
+固定种子历史:`20260716/18/19/21/23`;原型体系为 `20260725`。
 
 ## 6. 难度评测
 

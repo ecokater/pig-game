@@ -86,23 +86,33 @@ class MechanicsTest(unittest.TestCase):
         self.assertEqual(cells, ((3, 0), (2, 0), (1, 0)))
         self.assertEqual(direction, (-1, 0))
 
-    def test_final_set_has_mechanic_progression_after_sorting(self):
+    def test_final_set_is_archetype_balanced(self):
+        """原型体系的最终集不变量(取代旧的强制箭头节奏断言)。"""
+        from collections import Counter
+        from archetypes import ARCH_NAMES
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(root, 'levels.json')) as f:
             levels = json.load(f)
         self.assertEqual(len(levels), 1000)
         self.assertFalse(any('gates' in level for level in levels))
-        redirect_ids = [i for i, level in enumerate(levels)
-                        if level.get('redirects')]
-        self.assertGreaterEqual(len(redirect_ids), 800)
-        self.assertGreaterEqual(sum(len(level.get('redirects', [])) >= 2
-                                    for level in levels), 350)
+        # 每关都有合法原型标签,八种均衡出现
+        archs = [level.get('arch') for level in levels]
+        self.assertTrue(all(a in ARCH_NAMES for a in archs))
+        counts = Counter(archs)
+        self.assertEqual(set(counts), set(ARCH_NAMES))
+        self.assertGreaterEqual(min(counts.values()), 80)
+        # 机制自然分布(不强制数量,只要都有存在感)
+        self.assertGreaterEqual(
+            sum(bool(level.get('redirects')) for level in levels), 100)
         self.assertGreaterEqual(
             sum(bool(level.get('muds')) for level in levels), 200)
         mixed = [level for level in levels
                  if any(not isinstance(q[2], int) and set(q[2]) != {2}
                         for q in level['queues'])]
-        self.assertGreaterEqual(len(mixed), 200)
+        self.assertGreaterEqual(len(mixed), 400)
+        # 每关都带官方解线,长度等于最优步数
+        self.assertTrue(all(len(level.get('sol', [])) == level['min']
+                            for level in levels))
 
 
 if __name__ == '__main__':

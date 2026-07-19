@@ -45,6 +45,7 @@ def load_levels():
             'redirects': {tuple(c): tuple(d) for c, d in lv.get('redirects', [])},
             'muds': set(map(tuple, lv.get('muds', []))),
             'gates': [],
+            'arch': lv.get('arch'),
         })
     return levels
 
@@ -75,6 +76,12 @@ def _verify_one(item):
     errs = []
     if any(x not in (1, 2, 3) for _, _, lens in queues for x in lens):
         errs.append("猪体长只允许 1/2/3")
+
+    # 原型名副其实:arch 字段必须满足对应结构谓词
+    if lv['arch'] is not None:
+        from archetypes import classify
+        if lv['arch'] not in classify(lv):
+            errs.append(f"arch={lv['arch']} 与结构不符")
 
     # 连通性与本体尺寸
     if not connected(pen_set):
@@ -208,6 +215,17 @@ def main():
     if all_ok:
         print(f"难度有序 {scores[0]:.3f} -> {scores[-1]:.3f}; "
               "超阈值相似对 0")
+
+    # 原型分布与相邻同原型统计(有 arch 字段时)
+    archs = [lv['arch'] for lv in levels]
+    if any(a is not None for a in archs):
+        from collections import Counter
+        cnt = Counter(archs)
+        adj = sum(1 for i in range(1, len(archs))
+                  if archs[i] == archs[i - 1] and archs[i] is not None)
+        print("原型分布:" + "  ".join(f"{a}={cnt[a]}" for a in sorted(cnt)))
+        print(f"相邻同原型:{adj} 处")
+
     if all_ok and len(canons) == len(levels):
         print(f"ALL {len(levels)} LEVELS OK(含 D4 旋转/镜像全查重)")
         sys.exit(0)

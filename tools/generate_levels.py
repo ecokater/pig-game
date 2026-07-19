@@ -25,7 +25,7 @@ SEED = 20260716
 DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
 # 猪圈本体尺寸上限(宽 × 高)
-PEN_MAX_W, PEN_MAX_H = 8, 10
+PEN_MAX_W, PEN_MAX_H = 10, 13
 
 # 每个开口在圈外可见的排队猪数;之后的猪收纳进 🐷×n 徽章(与游戏一致)
 VISIBLE_PIGS = 2
@@ -405,7 +405,7 @@ def gen_shape(rng, target_cells):
     cells = None
     if cls == 'rect':
         opts = [(w, target_cells // w) for w in range(2, 9)
-                if target_cells % w == 0 and 2 <= target_cells // w <= 10]
+                if target_cells % w == 0 and 2 <= target_cells // w <= PEN_MAX_H]
         if not opts:
             return None
         w, h = rng.choice(opts)
@@ -413,7 +413,7 @@ def gen_shape(rng, target_cells):
     elif cls == 'notch':
         opts = [(w, (target_cells + 2) // w) for w in range(3, 9)
                 if (target_cells + 2) % w == 0
-                and 2 <= (target_cells + 2) // w <= 10]
+                and 2 <= (target_cells + 2) // w <= PEN_MAX_H]
         if not opts:
             return None
         w, h = rng.choice(opts)

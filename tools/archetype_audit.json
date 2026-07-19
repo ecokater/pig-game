@@ -1,0 +1,18 @@
+{
+  "seed": 20260727,
+  "levels": 1000,
+  "archetype_counts": {
+    "solo": 125,
+    "line": 125,
+    "cross": 125,
+    "pinwheel": 125,
+    "mirror": 125,
+    "parking": 125,
+    "jumbo": 125,
+    "swarm": 125
+  },
+  "difficulty_min": 8.341,
+  "difficulty_max": 61.474,
+  "monotonic": true,
+  "adjacent_same_arch": 228
+}
