@@ -1,34 +1,30 @@
 extends Node2D
-## 小猪棋子:1/2/3 格分节身体(头段 + 身段),头在前。
-## 过箭头会弯身:每个身段跟随头走过的路径。负责动画与点击区域。
-## 节点自身始终停在原点,身段子精灵直接摆在各自格子的世界坐标上;
-## wiggle 通过临时偏移节点整体实现。
-
-const HEAD_TEX := preload("res://art/pig_head.svg")
-const BODY_TEX := preload("res://art/pig_body.svg")
+## 小猪棋子:1/2/3 格身体作为**一整只猪**用矢量绘制,不再分节拼精灵。
+## 身体 = 沿各格中心的圆角胶囊(直身成长条,过箭头弯身成圆弧);
+## 前端画猪头(吻部+眼睛+耳朵),后端画小卷尾。
+## 逻辑格 cells(头在前)由 main.gd 读写;渲染点 _render_pts 是各格中心的
+## 世界坐标,滑行时沿折线插值。节点自身停在原点(wiggle 时临时偏移整体)。
 
 var main: Node2D
 var cells: Array = []      # Vector2i,头在前
 var dir: Vector2i
 var entered := false       # 已离开等待队列(进圈或跨在开口上)
 var qi := -1               # 所属开口队列下标
-var boost := 1.0           # 庆祝等外部缩放系数(呼吸动画每帧会覆盖 scale)
+var boost := 1.0           # 庆祝等外部缩放系数
 
 var _phase := 0.0
 var _wiggling := false
-var _segs: Array = []      # Sprite2D,与 cells 一一对应(0 = 头)
+var _render_pts: Array = []   # Vector2 世界坐标,与 cells 对应(0 = 头)
+var _render_dir: Vector2i     # 头朝向(滑行中随关键帧更新)
+var _tint := Color.WHITE      # 当前皮肤色(flash 时临时变亮黄)
 
 
 func setup(m: Node2D, cells_in: Array, dir_in: Vector2i, tint: Color) -> void:
 	main = m
 	cells = cells_in.duplicate()
 	dir = dir_in
-	for i in cells.size():
-		var spr := Sprite2D.new()
-		spr.texture = HEAD_TEX if i == 0 else BODY_TEX
-		spr.modulate = tint
-		add_child(spr)
-		_segs.append(spr)
+	_render_dir = dir_in
+	_tint = tint
 
 
 func _ready() -> void:
@@ -37,10 +33,7 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
-	var s: float = main.cell_size / 150.0 * 1.06 * boost \
-			* (1.0 + 0.025 * sin(Time.get_ticks_msec() / 140.0 + _phase))
-	for spr in _segs:
-		spr.scale = Vector2.ONE * s
+	queue_redraw()   # 呼吸/庆祝靠每帧重绘(矢量绘制,开销很小)
 
 
 func length() -> int:
@@ -56,8 +49,8 @@ func tail_cell() -> Vector2i:
 
 
 func set_tint(c: Color) -> void:
-	for spr in _segs:
-		spr.modulate = c
+	_tint = c
+	queue_redraw()
 
 
 func center_pos() -> Vector2:
@@ -86,51 +79,69 @@ func bounds_rect() -> Rect2:
 			(mx - mn + Vector2.ONE) * main.cell_size)
 
 
-func _seg_rot(i: int, cs: Array, d: Vector2i) -> float:
-	## 头段朝移动方向,身段朝向前一节
-	var toward: Vector2i = d if i == 0 else cs[i - 1] - cs[i]
-	return Vector2(toward).angle() + PI / 2.0
+# ---------- 姿态与动画 ----------
+
+func _cells_to_pts(cs: Array) -> Array:
+	var pts: Array = []
+	for c in cs:
+		pts.append(main.cell_center(c))
+	return pts
 
 
 func sync_pose() -> void:
-	for i in _segs.size():
-		_segs[i].position = main.cell_center(cells[i])
-		_segs[i].rotation = _seg_rot(i, cells, dir)
+	_render_pts = _cells_to_pts(cells)
+	_render_dir = dir
+	queue_redraw()
 
 
 func tween_pose(dur: float) -> void:
-	for i in _segs.size():
-		var tw := create_tween()
-		tw.tween_property(_segs[i], "position", main.cell_center(cells[i]), dur)\
-			.set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
-		_segs[i].rotation = _seg_rot(i, cells, dir)
+	var start := _render_pts.duplicate()
+	var target := _cells_to_pts(cells)
+	_render_dir = dir
+	var tw := create_tween()
+	tw.tween_method(func(t: float) -> void:
+		_lerp_pts(start, target, t), 0.0, 1.0, dur)\
+		.set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
 
 
 func slide_snapshots(snaps: Array, dur: float) -> void:
-	## snaps = [[cells 数组, dir], ...] 每一步一帧;分节沿折线跟随,
-	## 头段转向时旋转,身段各自朝向前一节。
+	## snaps = [[cells 数组, dir], ...] 每步一帧;整只猪沿折线平滑跟随。
 	if snaps.is_empty():
 		return
-	var part: float = dur / snaps.size()
-	var tw := create_tween()
+	var frames: Array = [_render_pts.duplicate()]
+	var dirs: Array = [_render_dir]
 	for snap in snaps:
-		var cs: Array = snap[0]
-		var d: Vector2i = snap[1]
-		tw.tween_property(_segs[0], "position", main.cell_center(cs[0]), part)\
-			.set_trans(Tween.TRANS_LINEAR)
-		tw.parallel().tween_property(_segs[0], "rotation",
-				_seg_rot(0, cs, d), part * 0.7)
-		for i in range(1, _segs.size()):
-			tw.parallel().tween_property(_segs[i], "position",
-					main.cell_center(cs[i]), part).set_trans(Tween.TRANS_LINEAR)
-			tw.parallel().tween_property(_segs[i], "rotation",
-					_seg_rot(i, cs, d), part * 0.7)
+		frames.append(_cells_to_pts(snap[0]))
+		dirs.append(snap[1])
+	var n := snaps.size()
+	var tw := create_tween()
+	tw.tween_method(func(t: float) -> void:
+		_apply_frame(frames, dirs, t), 0.0, float(n), dur)\
+		.set_trans(Tween.TRANS_LINEAR)
 	await tw.finished
 	sync_pose()
 
 
+func _apply_frame(frames: Array, dirs: Array, t: float) -> void:
+	var seg := int(floor(t))
+	if seg >= frames.size() - 1:
+		_render_pts = (frames[frames.size() - 1] as Array).duplicate()
+		_render_dir = dirs[dirs.size() - 1]
+	else:
+		_lerp_pts(frames[seg], frames[seg + 1], t - seg)
+		_render_dir = dirs[seg + 1]
+	queue_redraw()
+
+
+func _lerp_pts(a: Array, b: Array, f: float) -> void:
+	var pts: Array = []
+	for i in a.size():
+		pts.append((a[i] as Vector2).lerp(b[i], f))
+	_render_pts = pts
+	queue_redraw()
+
+
 func celebrate() -> void:
-	## 过关欢呼:整体弹跳缩放(经 boost,与呼吸动画兼容)
 	var tw := create_tween().set_loops(3)
 	tw.tween_property(self, "boost", 1.14, 0.15)
 	tw.tween_property(self, "boost", 1.0, 0.15)
@@ -138,16 +149,11 @@ func celebrate() -> void:
 
 func flash() -> void:
 	## 提示高亮:亮黄闪三下
-	var tint: Color = main.meta_tint()
+	var skin: Color = main.meta_tint()
 	var hot := Color(1.6, 1.5, 0.6)
 	var tw := create_tween().set_loops(3)
-	tw.tween_method(_set_seg_color, tint, hot, 0.16)
-	tw.tween_method(_set_seg_color, hot, tint, 0.16)
-
-
-func _set_seg_color(c: Color) -> void:
-	for spr in _segs:
-		spr.modulate = c
+	tw.tween_method(set_tint, skin, hot, 0.16)
+	tw.tween_method(set_tint, hot, skin, 0.16)
 
 
 func wiggle() -> void:
@@ -159,3 +165,84 @@ func wiggle() -> void:
 	tw.tween_property(self, "position", Vector2.ZERO, 0.14)
 	await tw.finished
 	_wiggling = false
+
+
+# ---------- 绘制:一整只猪 ----------
+
+func _draw() -> void:
+	if _render_pts.is_empty() or main == null:
+		return
+	var cell: float = main.cell_size
+	var breathe := 1.0 + 0.03 * sin(Time.get_ticks_msec() / 140.0 + _phase)
+	var R := cell * 0.40 * boost * breathe
+
+	var body := Color(1.0, 0.63, 0.72) * _tint
+	var dark := Color(0.80, 0.42, 0.52) * _tint
+	var belly := Color(1.0, 0.78, 0.85) * _tint
+
+	var pts := _render_pts
+	var face: Vector2 = Vector2(_render_dir)
+	if pts.size() >= 2:
+		face = (pts[0] - pts[1])
+	if face.length() < 0.01:
+		face = Vector2(_render_dir)
+	face = face.normalized()
+	var perp := Vector2(-face.y, face.x)
+
+	# 后端小卷尾(长身才有),画在身体下面
+	if pts.size() >= 2:
+		var tail_back: Vector2 = (pts[pts.size() - 1] - pts[pts.size() - 2]).normalized()
+		var troot: Vector2 = pts[pts.size() - 1] + tail_back * R * 0.7
+		draw_arc(troot, R * 0.34, 0.0, TAU, 20, dark, R * 0.14, true)
+
+	# 身体:深色描边胶囊 + 亮色胶囊 + 肚皮高光
+	_draw_capsule(pts, R + 3.0, dark)
+	_draw_capsule(pts, R, body)
+	_draw_capsule(pts, R * 0.62, belly)
+
+	var head: Vector2 = pts[0]
+
+	# 耳朵(头后侧两只三角)
+	for s in [1.0, -1.0]:
+		var e0: Vector2 = head - face * R * 0.15 + perp * s * R * 0.5
+		var tip: Vector2 = e0 + (perp * s * 0.5 - face * 0.2).normalized() * R * 0.7
+		var w: Vector2 = face * R * 0.28
+		draw_colored_polygon(PackedVector2Array([e0 - w, e0 + w, tip]), dark)
+
+	# 吻部
+	var snout: Vector2 = head + face * R * 0.5
+	_draw_oval(snout, R * 0.5, R * 0.42, face.angle(), belly)
+	for s in [1.0, -1.0]:
+		draw_circle(snout + perp * s * R * 0.17 + face * R * 0.08, R * 0.07, dark)
+
+	# 眼睛(白眼球 + 朝前的瞳孔)
+	for s in [1.0, -1.0]:
+		var eye: Vector2 = head + face * R * 0.02 + perp * s * R * 0.42
+		draw_circle(eye, R * 0.2, Color.WHITE)
+		draw_circle(eye + face * R * 0.06, R * 0.1, Color(0.15, 0.1, 0.12))
+
+
+func _draw_capsule(pts: Array, r: float, col: Color) -> void:
+	## 圆角胶囊 = 各点圆盘 ∪ 相邻点之间的矩形,直身成长条、弯身成圆弧。
+	for p in pts:
+		draw_circle(p, r, col)
+	for i in range(pts.size() - 1):
+		var a: Vector2 = pts[i]
+		var b: Vector2 = pts[i + 1]
+		var d: Vector2 = (b - a)
+		if d.length() < 0.01:
+			continue
+		var n := Vector2(-d.y, d.x).normalized() * r
+		draw_colored_polygon(PackedVector2Array([a + n, b + n, b - n, a - n]), col)
+
+
+func _draw_oval(c: Vector2, a: float, b: float, ang: float, col: Color) -> void:
+	var pts := PackedVector2Array()
+	var ca := cos(ang)
+	var sa := sin(ang)
+	for i in 20:
+		var t := TAU * i / 20.0
+		var x := cos(t) * a
+		var y := sin(t) * b
+		pts.append(c + Vector2(x * ca - y * sa, x * sa + y * ca))
+	draw_colored_polygon(pts, col)
